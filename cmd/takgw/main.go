@@ -3,10 +3,10 @@
 // Usage:
 //
 //	takgw serve      run the gateway
-//	takgw preflight  validate entity JSON read from stdin
+//	takgw preflight  check entity JSON lines against the documented acceptance rules
 //	takgw readback   publish test entities and confirm what comes back
 //
-// None of the subcommands is implemented yet.
+// preflight is implemented; serve and readback are not yet.
 package main
 
 import (
@@ -16,27 +16,31 @@ import (
 )
 
 // usage is printed for help, for a missing command and for an unknown command.
-const usage = `usage: takgw <command>
+const usage = `usage: takgw <command> [flags]
 
 commands:
   serve      run the gateway (not implemented yet)
-  preflight  validate entity JSON from stdin (not implemented yet)
+  preflight  check entity JSON lines against the documented acceptance rules
   readback   round-trip check of test entities (not implemented yet)
+
+Run "takgw <command> -h" for a command's flags.
 `
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-// run dispatches one subcommand and returns the process exit code. It takes its output streams as parameters so tests
-// can capture them.
-func run(args []string, stdout, stderr io.Writer) int {
+// run dispatches one subcommand and returns the process exit code. It takes its streams as parameters so tests can
+// supply input and capture output.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
 		return 2
 	}
 	switch args[0] {
-	case "serve", "preflight", "readback":
+	case "preflight":
+		return runPreflight(args[1:], stdin, stdout, stderr)
+	case "serve", "readback":
 		fmt.Fprintf(stderr, "takgw %s: not implemented yet\n", args[0])
 		return 1
 	case "help", "-h", "--help":

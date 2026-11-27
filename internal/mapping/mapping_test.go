@@ -71,7 +71,8 @@ func TestJSONGolden(t *testing.T) {
 		`"symbology":{"milStd2525C":{"sidc":"SFGPUC---------"}},` +
 		`"provenance":{"integrationName":"tak-interop-gateway","dataType":"cot","sourceId":"u-1",` +
 		`"sourceUpdateTime":"2026-11-27T16:00:00Z","sourceDescription":"sar-feed"},` +
-		`"indicators":{"simulated":true},"tracked":{"trackQualityWrapper":7}}`
+		`"indicators":{"simulated":true},"tracked":{"trackQualityWrapper":7},` +
+		`"dataClassification":{"default":{"level":"CLASSIFICATION_LEVELS_UNCLASSIFIED"}}}`
 	if string(got) != want {
 		t.Errorf("JSON mismatch\n got: %s\nwant: %s", got, want)
 	}
@@ -198,6 +199,43 @@ func TestMapRefuses(t *testing.T) {
 				t.Errorf("got %v, want %v", err, tt.want)
 			}
 		})
+	}
+}
+
+// TestSymbologyAlwaysSet checks the fallback: the integration guide lists a SIDC as always required, so a type that
+// doesn't transliterate still gets a generic symbol from its affiliation and battle dimension.
+func TestSymbologyAlwaysSet(t *testing.T) {
+	now := base.Add(30 * time.Second)
+	tests := map[string]string{
+		"a-f-G-U-C": "SFGPUC---------", // transliterates in full
+		"a-f":       "SFZP-----------", // no battle dimension: unknown
+		"a-h-A-UC":  "SHAP-----------", // a multi-character function atom: function left unspecified
+		"a-x-S":     "SUSP-----------", // "other" has no 2525C identity: unknown
+	}
+	for typ, want := range tests {
+		e := testEvent()
+		e.Type = typ
+		got, err := Map(e, testConfig(), now)
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		if got.Symbology == nil || *got.Symbology.MilStd2525C.SIDC != want {
+			t.Errorf("%s: SIDC %v, want %s", typ, got.Symbology, want)
+		}
+	}
+}
+
+// TestClassificationFromConfig checks that the feed's classification, not the default, is what the entity carries.
+func TestClassificationFromConfig(t *testing.T) {
+	now := base.Add(30 * time.Second)
+	cfg := testConfig()
+	cfg.Classification = "CLASSIFICATION_LEVELS_CONTROLLED_UNCLASSIFIED"
+	got, err := Map(testEvent(), cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got.DataClassification.Default.Level != cfg.Classification {
+		t.Errorf("classification %v, want the feed's %v", *got.DataClassification.Default.Level, cfg.Classification)
 	}
 }
 

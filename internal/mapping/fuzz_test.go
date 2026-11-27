@@ -20,7 +20,7 @@ var (
 
 // FuzzMap feeds parser-accepted events to the mapper. Map must never panic on anything the parser accepts, and
 // whatever it returns must hold these invariants: a well-formed UUIDv5 ID, live, an expiry after now and within the
-// 30-day bound, a non-empty name, the event's own position, a SIDC that is either absent or well-formed, and JSON that
+// 30-day bound, a non-empty name, the event's own position, a well-formed SIDC, a data classification, and JSON that
 // survives a round trip unchanged.
 //
 // Run it with: go test -fuzz=FuzzMap ./internal/mapping
@@ -63,8 +63,10 @@ func FuzzMap(f *testing.F) {
 			t.Fatal("empty display name")
 		case *e.Location.Position.LatitudeDegrees != float64(ev.Point.Lat) || *e.Location.Position.LongitudeDegrees != float64(ev.Point.Lon):
 			t.Fatal("position was not copied faithfully")
-		case e.Symbology != nil && !sidcPattern.MatchString(*e.Symbology.MilStd2525C.SIDC):
-			t.Fatalf("malformed SIDC %q", *e.Symbology.MilStd2525C.SIDC)
+		case e.Symbology == nil || !sidcPattern.MatchString(*e.Symbology.MilStd2525C.SIDC):
+			t.Fatalf("missing or malformed SIDC: %+v", e.Symbology)
+		case e.DataClassification == nil || e.DataClassification.Default == nil || e.DataClassification.Default.Level == nil:
+			t.Fatal("missing data classification")
 		}
 		first, err := json.Marshal(e)
 		if err != nil {

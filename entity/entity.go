@@ -39,14 +39,27 @@ const (
 // Template is ontology.template: the broad kind of entity.
 type Template string
 
-// TemplateTrack is the template for things observed or reported on the map, which is what CoT position reports are.
-const TemplateTrack Template = "TEMPLATE_TRACK"
+// The templates this project knows about. The mapper only emits TemplateTrack, the template for things observed or
+// reported on the map, which is what CoT position reports are. Preflight also recognizes the other two so it can say
+// which of their rules it does not check.
+const (
+	TemplateTrack Template = "TEMPLATE_TRACK"
+	TemplateAsset Template = "TEMPLATE_ASSET"
+	TemplateGeo   Template = "TEMPLATE_GEO"
+)
+
+// ClassificationLevel is dataClassification.default.level.
+type ClassificationLevel string
+
+// ClassificationUnclassified is the level Anduril's integration guide says to use "if nothing else".
+const ClassificationUnclassified ClassificationLevel = "CLASSIFICATION_LEVELS_UNCLASSIFIED"
 
 // Entity is one candidate entity.
 type Entity struct {
 	EntityID            *string              `json:"entityId,omitempty"`
 	IsLive              *bool                `json:"isLive,omitempty"`
 	ExpiryTime          *time.Time           `json:"expiryTime,omitempty"`
+	NoExpiry            *bool                `json:"noExpiry,omitempty"` // never set by the mapper; modeled because it exempts an entity from the expiry rules
 	Aliases             *Aliases             `json:"aliases,omitempty"`
 	MilView             *MilView             `json:"milView,omitempty"`
 	Ontology            *Ontology            `json:"ontology,omitempty"`
@@ -56,6 +69,18 @@ type Entity struct {
 	Provenance          *Provenance          `json:"provenance,omitempty"`
 	Indicators          *Indicators          `json:"indicators,omitempty"`
 	Tracked             *Tracked             `json:"tracked,omitempty"`
+	DataClassification  *Classification      `json:"dataClassification,omitempty"`
+}
+
+// Classification is the entity's data classification. Only the default for the whole entity is modeled.
+type Classification struct {
+	Default *ClassificationInformation `json:"default,omitempty"`
+}
+
+// ClassificationInformation is a classification level and its caveats.
+type ClassificationInformation struct {
+	Level   *ClassificationLevel `json:"level,omitempty"`
+	Caveats []string             `json:"caveats,omitempty"`
 }
 
 // Aliases holds the display name operators see.

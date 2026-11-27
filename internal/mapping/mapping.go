@@ -34,12 +34,22 @@ const (
 // It was generated once and must never change, or every entity would get a new ID.
 var namespace = [16]byte{0x09, 0xd9, 0xf5, 0xaa, 0xca, 0x07, 0x45, 0xb9, 0x82, 0xf7, 0x8b, 0x14, 0x98, 0x79, 0x3c, 0x9d}
 
+// DefaultTrackQuality is the "conservative default" Anduril's integration guide recommends when a source gives no
+// quality signal, which CoT doesn't.
+const DefaultTrackQuality = 2
+
 // Config describes one CoT feed.
 type Config struct {
 	Source          string // names the feed; part of every entity ID, so the same CoT uid from two feeds is two entities
 	IntegrationName string // provenance.integrationName; DefaultIntegrationName if empty
 	Simulated       bool   // set indicators.simulated on every entity from this feed
-	TrackQuality    int    // tracked.trackQualityWrapper for every track, 0 to 15: a policy choice, not derived from CoT
+	// TrackQuality is tracked.trackQualityWrapper for every track, 0 to 15. CoT carries no quality signal, so this is a
+	// per-feed policy; DefaultTrackQuality is the documented conservative choice.
+	TrackQuality int
+	// Classification is dataClassification.default.level for every entity from this feed. It is per feed because a
+	// classification has to come from whoever operates the feed, not from a gateway default; when it's left empty,
+	// ClassificationUnclassified is used, the level the integration guide says to fall back to.
+	Classification entity.ClassificationLevel
 }
 
 // validate reports the first problem with the config, or nil.
@@ -124,9 +134,18 @@ func Map(ev cot.Event, cfg Config, now time.Time) (entity.Entity, error) {
 			SemiMajorAxisM: new(ce), SemiMinorAxisM: new(ce), OrientationD: new(0.0),
 		}}
 	}
-	if sidc, ok := sidcFor(atoms); ok {
-		e.Symbology = &entity.Symbology{MilStd2525C: &entity.MilStd2525C{SIDC: new(sidc)}}
+	// The integration guide lists a SIDC as "always (derive from disposition + environment)", so when the full type
+	// doesn't transliterate, fall back to a generic symbol built from the affiliation and battle dimension alone.
+	sidc, ok := sidcFor(atoms)
+	if !ok {
+		sidc = genericSIDC(atoms)
 	}
+	e.Symbology = &entity.Symbology{MilStd2525C: &entity.MilStd2525C{SIDC: new(sidc)}}
+	classification := cfg.Classification
+	if classification == "" {
+		classification = entity.ClassificationUnclassified
+	}
+	e.DataClassification = &entity.Classification{Default: &entity.ClassificationInformation{Level: new(classification)}}
 	if cfg.Simulated || exercise {
 		e.Indicators = &entity.Indicators{}
 		if cfg.Simulated {
@@ -188,8 +207,8 @@ func environmentFor(letter string) (entity.Environment, bool) {
 // sidcFor builds a 15-character MIL-STD-2525C SIDC from a CoT atom type, whose atoms follow the same hierarchy:
 // coding scheme S (warfighting), the affiliation, the battle dimension, status P (present), six function characters
 // taken from the remaining atoms, then five dashes for the unset modifier, country and order-of-battle fields. So
-// a-f-G-U-C becomes SFGPUC---------. It returns false, and the entity goes without symbology, when the type doesn't
-// transliterate cleanly: no battle dimension, more than six function atoms, or an atom that isn't one character.
+// a-f-G-U-C becomes SFGPUC---------. It returns false when the type doesn't transliterate cleanly: no battle dimension,
+// more than six function atoms, or an atom that isn't one character. Map then falls back to genericSIDC.
 func sidcFor(atoms []string) (string, bool) {
 	if len(atoms) < 3 || len(atoms) > 3+6 {
 		return "", false
@@ -212,6 +231,21 @@ func sidcFor(atoms []string) (string, bool) {
 		b.WriteByte('-')
 	}
 	return b.String(), true
+}
+
+// genericSIDC is the fallback symbol when the full type doesn't transliterate: the affiliation and battle dimension
+// with the function left unspecified, so a-f becomes SFZP----------- and a-f-G-UC becomes SFGP-----------. Map only
+// calls it after the affiliation and dimension letters have been validated.
+func genericSIDC(atoms []string) string {
+	affiliation := strings.ToUpper(atoms[1])
+	if affiliation == "O" || affiliation == "X" {
+		affiliation = "U"
+	}
+	dimension := "Z" // unknown
+	if len(atoms) >= 3 {
+		dimension = strings.ToUpper(atoms[2])
+	}
+	return "S" + affiliation + dimension + "P" + strings.Repeat("-", 11)
 }
 
 // isAlnum reports whether b is an ASCII letter or digit.
