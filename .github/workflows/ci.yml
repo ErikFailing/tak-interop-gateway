@@ -8,18 +8,43 @@ on:
 permissions:
   contents: read
 
+# Every action is pinned to a full commit SHA, with the release it corresponds to in a comment. Dependabot
+# (.github/dependabot.yml) proposes updates to both.
+#
+# govulncheck and golangci-lint are run with `go run tool@version`, which fetches them through the Go module proxy and
+# checks them against the checksum database. GOTOOLCHAIN is set to the module's own toolchain (from go.mod), because
+# otherwise `go run` builds each tool with the Go version in the tool's go.mod, and a tool built with an older Go can't
+# analyze code that targets a newer one.
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # TODO: pin these actions to full commit SHAs.
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
+          cache: false # no dependencies yet, so there is no go.sum to key a cache on
+      - run: go version
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
+      - name: govulncheck
+        run: GOTOOLCHAIN="$(go env GOVERSION)" go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
       - name: fuzz smoke (FuzzParse, 30s)
         run: go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/cot
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: golangci-lint
+        run: GOTOOLCHAIN="$(go env GOVERSION)" go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...

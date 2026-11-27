@@ -75,12 +75,13 @@ func TestValidate(t *testing.T) {
 // TestDeterministic checks that the same config reproduces the same events and a different seed does not.
 func TestDeterministic(t *testing.T) {
 	cfg := testConfig()
-	if render(t, cfg, 5) != render(t, cfg, 5) {
+	first, second := render(t, cfg, 5), render(t, cfg, 5)
+	if first != second {
 		t.Error("same config produced different output")
 	}
 	other := cfg
 	other.Seed = 2
-	if render(t, cfg, 5) == render(t, other, 5) {
+	if first == render(t, other, 5) {
 		t.Error("different seeds produced identical output")
 	}
 }

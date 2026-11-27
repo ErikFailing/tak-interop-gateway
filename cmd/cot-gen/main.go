@@ -111,8 +111,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				return fail(stderr, 1, "marshal: %v", err)
 			}
 			// A bufio.Writer remembers its first error and returns it from Flush, so checking once per tick is enough.
-			w.Write(b)
-			w.WriteByte('\n')
+			_, _ = w.Write(b)
+			_ = w.WriteByte('\n')
 		}
 		if err := w.Flush(); err != nil {
 			return fail(stderr, 1, "write: %v", err)

@@ -1,0 +1,19 @@
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck and unused.
+  default: standard
+  enable:
+    - errorlint # errors compared or type-asserted without errors.Is and errors.As
+    - misspell
+    - nolintlint # //nolint directives must name a linter and say why
+    - unconvert
+  exclusions:
+    presets:
+      # The conventional exceptions: unchecked fmt.Fprint* to stdout/stderr, Close and Flush.
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

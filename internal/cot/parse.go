@@ -86,7 +86,7 @@ func (lim Limits) Parse(data []byte) (Event, error) {
 	// 3: The structure is known to be safe and as expected, so decode it into the model.
 	var ev Event
 	if err := xml.Unmarshal(data, &ev); err != nil {
-		return Event{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		return Event{}, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	// 4: Check the decoded values.
 	if err := ev.validate(); err != nil {
@@ -112,7 +112,7 @@ func (lim Limits) scan(data []byte) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrMalformed, err)
+			return fmt.Errorf("%w: %w", ErrMalformed, err)
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
