@@ -35,6 +35,7 @@ Keeping the core free of network and SDK code means:
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
 | `entity` | An SDK-free model of the Lattice entity fields this project sets, with the REST API's JSON field names. Public, so Entity Preflight and other Go projects can use it. |
 | `internal/mapping` | CoT event to candidate entity. See the mapping table below. |
+| `internal/pipeline` | One message's whole path: parse, map, then Entity Preflight as a gate. Reads the clock once per message, so the mapper and the checker agree on "now", and wraps every refusal with its stage (`ErrParse`, `ErrMap`, `ErrRejected`) as well as the stage's own reason. `takgw serve` will run one pipeline per feed. |
 | `internal/state` | Per-entity source update times, change detection, cross-source ID collision checks |
 | `internal/publish` | The `Publisher` interface, with an SDK adapter and an in-process fake |
 | `internal/health` | Publishes the gateway itself as an asset with a health component |
@@ -118,5 +119,19 @@ from the code, and a test fails if the committed copy is stale.
 - `FuzzCheckJSON` (in `preflight`) feeds arbitrary bytes to `CheckJSON`. It must never panic, must refuse with
   `ErrInvalidJSON` or return violations that name a real rule, and must give the same answer on a second run. CI runs
   it for 30 seconds on every push.
-- The pipeline fuzz oracle will go beyond "does not crash": every entity the pipeline emits from fuzzed CoT must also
-  pass Entity Preflight.
+- `FuzzPipeline` (in `internal/pipeline`) is the end-to-end oracle. It treats the input as a TCP stream from a TAK
+  feed: the framer splits it, and one pipeline processes every message. It checks what comes out, not just that
+  nothing crashed:
+  - an entity the pipeline would publish has no preflight finding but an out-of-order warning, and its JSON, checked
+    from scratch, has none at all;
+  - preflight may reject an entity only for a repeated report (an unchanged source update time); any other error rule
+    firing means the mapper built an entity the server would refuse;
+  - every refusal wraps exactly one stage sentinel and a sentinel of that stage's own;
+  - a second, fresh pipeline gives exactly the same outcomes for the same stream.
+
+  The oracle was mutation-tested: four bugs planted in the mapper (a wrong SIDC affiliation, a wrong environment, an
+  empty display name, an expiry clamp of 31 days) were each caught. The clamp was missed until a seed reached that
+  branch, so the seeds now include a stale time decades out, as static markers send. CI runs it for 30 seconds on
+  every push.
+- Out-of-order and repeated reports are expected on TAK networks, which rebroadcast. Preflight flags them, and the
+  state stage (`internal/state`, next) will decide what to drop before preflight sees them.

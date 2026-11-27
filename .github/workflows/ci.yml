@@ -42,6 +42,8 @@ jobs:
         run: go test -run='^$' -fuzz=FuzzMap -fuzztime=30s ./internal/mapping
       - name: fuzz smoke (FuzzCheckJSON, 30s)
         run: go test -run='^$' -fuzz=FuzzCheckJSON -fuzztime=30s ./preflight
+      - name: fuzz smoke (FuzzPipeline, 30s)
+        run: go test -run='^$' -fuzz=FuzzPipeline -fuzztime=30s ./internal/pipeline
 
   lint:
     runs-on: ubuntu-latest

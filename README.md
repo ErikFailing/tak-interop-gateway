@@ -4,8 +4,9 @@ A gateway that translates TAK Cursor-on-Target (CoT) traffic into entities for t
 validator, Entity Preflight, that checks every entity against the platform's documented acceptance rules before it is
 sent.
 
-> **Status: early development.** Working today: the CoT parser and stream framer, the CoT-to-entity mapper,
-> `takgw preflight`, and the `cot-gen` test-data generator. `takgw serve` and `takgw readback` are not implemented yet.
+> **Status: early development.** Working today: the CoT parser and stream framer, the CoT-to-entity mapper, the
+> offline pipeline that ties them to Entity Preflight, `takgw preflight`, and the `cot-gen` test-data generator.
+> `takgw serve` and `takgw readback` are not implemented yet.
 
 ## Components
 
@@ -67,6 +68,7 @@ go test -run='^$' -fuzz=FuzzParse ./internal/cot           # runs until Ctrl-C; 
 go test -run='^$' -fuzz=FuzzFramer ./internal/transport
 go test -run='^$' -fuzz=FuzzMap ./internal/mapping
 go test -run='^$' -fuzz=FuzzCheckJSON ./preflight
+go test -run='^$' -fuzz=FuzzPipeline ./internal/pipeline
 ```
 
 - `FuzzParse` checks that the CoT parser never panics and that anything it accepts survives a marshal and re-parse
@@ -76,6 +78,10 @@ go test -run='^$' -fuzz=FuzzCheckJSON ./preflight
 - `FuzzMap` checks that every entity the mapper returns holds its invariants and survives a JSON round trip.
 - `FuzzCheckJSON` checks that Entity Preflight never panics on arbitrary input, refuses what it can't read with a
   typed error, and gives the same answer every time.
+- `FuzzPipeline` is the end-to-end oracle. It feeds a fuzzed TCP stream through the framer, parser, mapper and Entity
+  Preflight, and checks what comes out, not just that nothing crashed: every entity the gateway would publish must pass
+  preflight cleanly, both as a value and as JSON. Planting bugs in the mapper (a wrong SIDC letter, a wrong
+  environment, an empty name, an expiry clamp past 30 days) confirmed that it catches each one.
 
 Failing inputs are saved under each package's `testdata/fuzz/` and replayed by plain `go test` from then on.
 

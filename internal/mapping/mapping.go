@@ -52,8 +52,9 @@ type Config struct {
 	Classification entity.ClassificationLevel
 }
 
-// validate reports the first problem with the config, or nil.
-func (c Config) validate() error {
+// Validate reports the first problem with the config, or nil. Map checks it on every call; a caller holding a config
+// for a long-running feed can check it once at startup instead, and fail before any traffic arrives.
+func (c Config) Validate() error {
 	if c.Source == "" || len(c.Source) > 256 || strings.IndexFunc(c.Source, unicode.IsControl) >= 0 {
 		return fmt.Errorf("%w: source must be 1-256 characters with no control characters", ErrConfig)
 	}
@@ -71,7 +72,7 @@ func (c Config) validate() error {
 // affiliation or dimension letter it doesn't know, or a report that has already gone stale.
 func Map(ev cot.Event, cfg Config, now time.Time) (entity.Entity, error) {
 	// 1: Check the config and the CoT type.
-	if err := cfg.validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return entity.Entity{}, err
 	}
 	atoms := strings.Split(ev.Type, "-")
