@@ -1,6 +1,8 @@
 # Build output
 /takgw
 /takgw.exe
+/cot-gen
+/cot-gen.exe
 /dist/
 
 # Test and coverage artifacts

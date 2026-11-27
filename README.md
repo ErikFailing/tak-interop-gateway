@@ -33,6 +33,22 @@ go build ./...
 go test -race ./...
 ```
 
+## Test data: `cot-gen`
+
+`cot-gen` writes a synthetic search-and-rescue scenario as CoT events, one XML event per line. A search team walks
+north abreast while a fixed marker shows the missing person's last known position. Every event is labeled as
+simulated in its remarks, and a given `-seed` and `-start` always produce the same output.
+
+```bash
+# Three ticks of four team members, to stdout
+go run ./cmd/cot-gen -ticks 3
+
+# Stream to a local TAK server's TCP input in real time, until Ctrl-C
+go run ./cmd/cot-gen -tcp 127.0.0.1:8087 -realtime -ticks 0
+```
+
+Run `go run ./cmd/cot-gen -h` for every flag.
+
 ## Disclaimer
 
 This is an independent, unofficial project. It is not affiliated with, endorsed by or sponsored by Anduril Industries

@@ -25,10 +25,12 @@ Keeping the core free of network and SDK code means:
 | Package | Responsibility |
 |---|---|
 | `cmd/takgw` | The binary and its subcommands (`serve`, `preflight`, `readback`) |
+| `cmd/cot-gen` | Writes a synthetic, labeled search-and-rescue scenario as CoT, to stdout or a TCP listener |
+| `internal/cotgen` | The deterministic scenario behind `cot-gen` |
 | `preflight` | Entity Preflight: rules for a candidate entity, each with an ID, a reason and a link to the public documentation it encodes. Public, so other Go projects can import it. |
 | `readback` | Round-trip verification of the project's own test entities. Public. |
 | `internal/transport` | Connections to TAK servers and clients (TCP, and TLS with client certificates) and CoT stream framing |
-| `internal/cot` | A hardened CoT parser with size and nesting limits, and the CoT event model |
+| `internal/cot` | The CoT event model (shared by the generator and the future parser), and a hardened parser with size and nesting limits (not written yet) |
 | `internal/mapping` | CoT event to candidate entity: identity, MIL-STD-2525C symbology, location, expiry, provenance |
 | `internal/state` | Per-entity source update times, change detection, cross-source ID collision checks |
 | `internal/publish` | The `Publisher` interface, with an SDK adapter and an in-process fake |
