@@ -29,7 +29,7 @@ Keeping the core free of network and SDK code means:
 | `internal/cotgen` | The deterministic scenario behind `cot-gen` |
 | `preflight` | Entity Preflight: rules for a candidate entity, each with an ID, a reason and a link to the public documentation it encodes. Public, so other Go projects can import it. |
 | `readback` | Round-trip verification of the project's own test entities. Public. |
-| `internal/transport` | Connections to TAK servers and clients (TCP, and TLS with client certificates) and CoT stream framing |
+| `internal/transport` | `Framer`: splits a TCP stream into one size-limited message per event, using the parser's own tokenizer. Connections to TAK servers and clients (TCP, TLS with client certificates) are still to come. |
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
 | `internal/mapping` | CoT event to candidate entity: identity, MIL-STD-2525C symbology, location, expiry, provenance |
 | `internal/state` | Per-entity source update times, change detection, cross-source ID collision checks |
@@ -46,5 +46,12 @@ Keeping the core free of network and SDK code means:
 - The parser rejects duplicate attributes and duplicate singleton elements (a second `<point>`, `<contact>`,
   `<track>`...). Go keeps the last one, other parsers often keep the first, so two systems could read the same message
   differently.
+- `FuzzFramer` (in `internal/transport`) checks four properties of the framer:
+  - delivering the same bytes in different read sizes gives the same frames;
+  - the frames, joined in order, are a prefix of the input;
+  - no frame exceeds the limit;
+  - any frame the parser accepts frames back to exactly itself.
+
+  CI runs it for 30 seconds on every push.
 - The pipeline fuzz oracle will go beyond "does not crash": every entity the pipeline emits must also pass Entity
   Preflight.

@@ -36,12 +36,16 @@ go test -race ./...
 ## Fuzzing
 
 ```bash
-go test -run='^$' -fuzz=FuzzParse ./internal/cot   # runs until Ctrl-C; add -fuzztime=60s to bound it
+go test -run='^$' -fuzz=FuzzParse ./internal/cot           # runs until Ctrl-C; add -fuzztime=60s to bound it
+go test -run='^$' -fuzz=FuzzFramer ./internal/transport
 ```
 
-`FuzzParse` checks that the CoT parser never panics and that anything it accepts survives a marshal and re-parse
-unchanged. Failing inputs are saved under `internal/cot/testdata/fuzz/FuzzParse/` and replayed by plain `go test`
-from then on.
+- `FuzzParse` checks that the CoT parser never panics and that anything it accepts survives a marshal and re-parse
+  unchanged.
+- `FuzzFramer` checks that splitting a TCP stream into messages doesn't depend on how the bytes arrive, never invents
+  or reorders data, respects the size limit, and agrees with the parser.
+
+Failing inputs are saved under each package's `testdata/fuzz/` and replayed by plain `go test` from then on.
 
 ## Test data: `cot-gen`
 
