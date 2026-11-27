@@ -1,9 +1,11 @@
-// Package pipeline is the gateway's path for one CoT message: parse it, map it to a candidate entity, and check the
-// entity with Entity Preflight before anything is published. It has no network and no SDK, so the whole path can be
-// fuzzed (FuzzPipeline) and then reused unchanged by `takgw serve`.
+// Package pipeline is the gateway's path for one CoT message: parse it, map it to a candidate entity, let the state
+// stage drop repeats, late arrivals and unchanged reports, check what's left with Entity Preflight, and publish it.
+// It has no network and no SDK of its own (the Publisher is passed in), so the whole path can be fuzzed with the
+// in-memory publisher (FuzzPipeline) and then run unchanged by `takgw serve`.
 package pipeline
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -11,72 +13,118 @@ import (
 	"github.com/erikfailing/tak-interop-gateway/entity"
 	"github.com/erikfailing/tak-interop-gateway/internal/cot"
 	"github.com/erikfailing/tak-interop-gateway/internal/mapping"
+	"github.com/erikfailing/tak-interop-gateway/internal/publish"
+	"github.com/erikfailing/tak-interop-gateway/internal/state"
 	"github.com/erikfailing/tak-interop-gateway/preflight"
 )
 
-// The stage at which Process dropped a message. Every error from Process wraps exactly one of these, followed by the
-// stage's own cause (a cot, mapping or preflight sentinel), so a caller can count drops per stage and still use
-// errors.Is on the specific reason.
+// The stage at which Process stopped a message. Every error from Process wraps exactly one of these, followed by the
+// stage's own cause (a cot, mapping, state or preflight sentinel, or the publisher's error), so a caller can count
+// per stage and still use errors.Is on the specific reason. ErrDropped is routine traffic shaping, not a failure.
 var (
 	ErrParse    = errors.New("pipeline: CoT message refused by the parser")
 	ErrMap      = errors.New("pipeline: event refused by the mapper")
+	ErrDropped  = errors.New("pipeline: report dropped by the state stage")
 	ErrRejected = errors.New("pipeline: entity rejected by Entity Preflight")
+	ErrPublish  = errors.New("pipeline: publishing failed")
 )
+
+// Config assembles a pipeline for one feed.
+type Config struct {
+	Mapping   mapping.Config
+	Limits    cot.Limits // the parser's limits; the zero value means cot.DefaultLimits
+	State     state.Config
+	Publisher publish.Publisher
+	Clock     func() time.Time // read once per message; nil means time.Now
+}
 
 // Result is what the pipeline made of one message.
 type Result struct {
+	// Entity is the mapped entity, set once mapping succeeded, including when it was then dropped or rejected, so the
+	// caller can log what it was.
 	Entity entity.Entity
-	// Violations are the entity's preflight findings. On success they are warnings and notes only; when Process
-	// returns ErrRejected they include at least one error, and the entity must not be published.
+	// Violations are the entity's preflight findings: warnings and notes when it was published, at least one error
+	// when Process returned ErrRejected.
 	Violations []preflight.Violation
 }
 
-// Pipeline processes the messages of one CoT feed, in arrival order. It is not safe for concurrent use: its preflight
-// Checker remembers each entity's last update, which only means something for one ordered stream.
+// Pipeline processes the messages of one CoT feed, in arrival order. It is not safe for concurrent use: its state
+// stage remembers each entity's last publish, which only means something for one ordered stream.
 type Pipeline struct {
-	cfg     mapping.Config
+	mapping mapping.Config
 	limits  cot.Limits
 	clock   func() time.Time
-	at      time.Time // when the current message is being processed; the mapper and the checker both use it
-	checker *preflight.Checker
+	state   *state.Tracker
+	pub     publish.Publisher
 }
 
 // New returns a pipeline for one feed. It checks the config now, so a bad config fails at startup rather than on
-// every message. clock is read once per message.
-func New(cfg mapping.Config, limits cot.Limits, clock func() time.Time) (*Pipeline, error) {
-	if err := cfg.Validate(); err != nil {
+// every message.
+func New(cfg Config) (*Pipeline, error) {
+	// 1: Check the parts and fill in the defaults.
+	if err := cfg.Mapping.Validate(); err != nil {
 		return nil, err
 	}
-	p := &Pipeline{cfg: cfg, limits: limits, clock: clock}
-	// The checker reads the time the pipeline already read for this message, not the clock itself. Reading the clock
-	// twice would let a report that goes stale between mapping and checking pass one stage and fail the other.
-	p.checker = preflight.NewChecker(func() time.Time { return p.at })
+	if cfg.Publisher == nil {
+		return nil, errors.New("pipeline: no publisher")
+	}
+	tracker, err := state.New(cfg.State)
+	if err != nil {
+		return nil, err
+	}
+	p := &Pipeline{mapping: cfg.Mapping, limits: cfg.Limits, clock: cfg.Clock, state: tracker, pub: cfg.Publisher}
+	if p.limits == (cot.Limits{}) {
+		p.limits = cot.DefaultLimits
+	}
+	if p.clock == nil {
+		p.clock = time.Now
+	}
 	return p, nil
 }
 
-// Process takes one framed CoT message to an entity that is ready to publish. When it returns an error, nothing should
-// be published; ErrRejected still returns the entity and its violations, for logging.
-func (p *Pipeline) Process(msg []byte) (Result, error) {
-	// 1: One clock reading for the whole message.
-	p.at = p.clock()
+// Tracked returns how many entities the state stage currently remembers.
+func (p *Pipeline) Tracked() int {
+	return p.state.Len()
+}
 
-	// 2: Parse, then map. Each refusal is wrapped with its stage.
+// Process takes one framed CoT message all the way to the publisher. It returns nil once the entity has been
+// published, and otherwise an error naming the stage that stopped it.
+func (p *Pipeline) Process(ctx context.Context, msg []byte) (Result, error) {
+	// 1: One clock reading for the whole message. Every stage gets this same time: reading the clock again would let
+	// a report that goes stale between mapping and checking pass one stage and fail the next.
+	at := p.clock()
+
+	// 2: Parse, then map.
 	ev, err := p.limits.Parse(msg)
 	if err != nil {
 		return Result{}, fmt.Errorf("%w: %w", ErrParse, err)
 	}
-	e, err := mapping.Map(ev, p.cfg, p.at)
+	e, err := mapping.Map(ev, p.mapping, at)
 	if err != nil {
 		return Result{}, fmt.Errorf("%w: %w", ErrMap, err)
 	}
+	res := Result{Entity: e}
 
-	// 3: Check the entity. An error-severity violation means the server would reject or discard it, so it goes no
-	// further; warnings and notes travel with the result.
-	vs := p.checker.Check(e)
-	for _, v := range vs {
+	// 3: Let the state stage drop repeats, late arrivals and unchanged reports before anything is checked or sent.
+	if err := p.state.Admit(e, at); err != nil {
+		return res, fmt.Errorf("%w: %w", ErrDropped, err)
+	}
+
+	// 4: Check the entity. The state stage owns ordering and records only what was actually published, so preflight
+	// runs here without history, on a fresh Checker: a Checker's own memory would count a report whose publish failed
+	// as sent. An error-severity violation means the server would reject the entity, so it goes no further; warnings
+	// and notes travel with the result.
+	res.Violations = preflight.NewChecker(func() time.Time { return at }).Check(e)
+	for _, v := range res.Violations {
 		if v.Rule.Severity == preflight.Error {
-			return Result{Entity: e, Violations: vs}, fmt.Errorf("%w: %s", ErrRejected, v)
+			return res, fmt.Errorf("%w: %s", ErrRejected, v)
 		}
 	}
-	return Result{Entity: e, Violations: vs}, nil
+
+	// 5: Publish, and only then record it, so a failed publish doesn't make the next report look like a repeat.
+	if err := p.pub.Publish(ctx, e); err != nil {
+		return res, fmt.Errorf("%w: %w", ErrPublish, err)
+	}
+	p.state.Record(e, at)
+	return res, nil
 }

@@ -4,14 +4,14 @@ TAK Interop Gateway is built as ports and adapters: a pure core that does all th
 state tracking, with the network pushed out to adapters at the edges.
 
 ```
- TAK side (in)                 core (no network, no SDK)                          Lattice side (out)
-┌───────────┐  bytes  ┌──────────────┐ event ┌─────────┐ entity ┌───────────┐ verdict ┌─────────────────┐
-│ transport │ ──────▶ │ framing +    │ ────▶ │ mapping │ ─────▶ │ preflight │ ──────▶ │ publish adapter │
-└───────────┘         │ CoT parser   │       └─────────┘        └───────────┘         │ (SDK or fake)   │
-                      └──────────────┘            ▲                                   └─────────────────┘
-                                             ┌─────────┐
-                                             │  state  │  monotonic update times, change detection,
-                                             └─────────┘  cross-source ID collisions
+ TAK side (in)                     core (no network, no SDK)                                Lattice side (out)
+┌───────────┐ bytes ┌────────────┐ event ┌─────────┐ entity ┌───────┐ new ┌───────────┐ pass ┌─────────────────┐
+│ transport │ ────▶ │ framing +  │ ────▶ │ mapping │ ─────▶ │ state │ ──▶ │ preflight │ ───▶ │ publish adapter │
+└───────────┘       │ CoT parser │       └─────────┘        └───────┘     └───────────┘      │ (JSONL, fake,   │
+                    └────────────┘                              │                            │  later the SDK) │
+                                                                ▼                            └─────────────────┘
+                                                  drops repeats, late arrivals          records each entity in
+                                                  and unchanged reports                 state only once it's sent
 ```
 
 Keeping the core free of network and SDK code means:
@@ -26,7 +26,7 @@ Keeping the core free of network and SDK code means:
 
 | Package | Responsibility |
 |---|---|
-| `cmd/takgw` | The binary and its subcommands (`serve`, `preflight`, `readback`) |
+| `cmd/takgw` | The binary and its subcommands. `serve` reads CoT from stdin or plain TCP (with a connection limit, an idle timeout and a bounded queue in front of the pipeline) and publishes offline as JSON lines. `preflight` checks entity JSON lines. `readback` is still to come. |
 | `cmd/cot-gen` | Writes a synthetic, labeled search-and-rescue scenario as CoT, to stdout or a TCP listener |
 | `internal/cotgen` | The deterministic scenario behind `cot-gen` |
 | `preflight` | Entity Preflight: the documented acceptance rules for a candidate entity, each with an ID, a severity and pinned links to the public documentation it encodes. See [rules.md](rules.md) and the section below. Public, so other Go projects can import it. |
@@ -35,9 +35,9 @@ Keeping the core free of network and SDK code means:
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
 | `entity` | An SDK-free model of the Lattice entity fields this project sets, with the REST API's JSON field names. Public, so Entity Preflight and other Go projects can use it. |
 | `internal/mapping` | CoT event to candidate entity. See the mapping table below. |
-| `internal/pipeline` | One message's whole path: parse, map, then Entity Preflight as a gate. Reads the clock once per message, so the mapper and the checker agree on "now", and wraps every refusal with its stage (`ErrParse`, `ErrMap`, `ErrRejected`) as well as the stage's own reason. `takgw serve` will run one pipeline per feed. |
-| `internal/state` | Per-entity source update times, change detection, cross-source ID collision checks |
-| `internal/publish` | The `Publisher` interface, with an SDK adapter and an in-process fake |
+| `internal/pipeline` | One message's whole path: parse, map, state, Entity Preflight as a gate, publish. Reads the clock once per message, so every stage agrees on "now", and wraps every refusal with its stage (`ErrParse`, `ErrMap`, `ErrDropped`, `ErrRejected`, `ErrPublish`) as well as the stage's own reason. `takgw serve` runs one pipeline per feed. |
+| `internal/state` | The `Tracker`: drops a report that repeats or predates the last published one, and holds back one that changes nothing until a refresh is due. Memory is bounded. See the section below. |
+| `internal/publish` | The `Publisher` interface, with `Memory` (the in-process fake for tests) and `JSONL` (offline output, in the format `takgw preflight` reads). The SDK adapter, `internal/publish/latticesdk`, is still to come. |
 | `internal/health` | Publishes the gateway itself as an asset with a health component |
 
 ## Mapping
@@ -120,18 +120,47 @@ from the code, and a test fails if the committed copy is stale.
   `ErrInvalidJSON` or return violations that name a real rule, and must give the same answer on a second run. CI runs
   it for 30 seconds on every push.
 - `FuzzPipeline` (in `internal/pipeline`) is the end-to-end oracle. It treats the input as a TCP stream from a TAK
-  feed: the framer splits it, and one pipeline processes every message. It checks what comes out, not just that
-  nothing crashed:
-  - an entity the pipeline would publish has no preflight finding but an out-of-order warning, and its JSON, checked
-    from scratch, has none at all;
-  - preflight may reject an entity only for a repeated report (an unchanged source update time); any other error rule
-    firing means the mapper built an entity the server would refuse;
+  feed: the framer splits it, and one pipeline, publishing to the in-memory fake, processes every message. It checks
+  what comes out, not just that nothing crashed:
+  - every entity published has no preflight finding of any severity, and its JSON, checked from scratch, has none
+    either;
+  - preflight never rejects anything, because the mapper never builds an entity the server would refuse and the state
+    stage removes repeats first;
+  - each report the mapper accepts is published or dropped exactly as an independent reference model of the state
+    policy predicts, with the same reason, so published updates strictly increase per entity and nothing that changed
+    is ever held back;
   - every refusal wraps exactly one stage sentinel and a sentinel of that stage's own;
+  - the fake publisher received exactly the entities reported as published, in order;
   - a second, fresh pipeline gives exactly the same outcomes for the same stream.
 
-  The oracle was mutation-tested: four bugs planted in the mapper (a wrong SIDC affiliation, a wrong environment, an
-  empty display name, an expiry clamp of 31 days) were each caught. The clamp was missed until a seed reached that
-  branch, so the seeds now include a stale time decades out, as static markers send. CI runs it for 30 seconds on
-  every push.
-- Out-of-order and repeated reports are expected on TAK networks, which rebroadcast. Preflight flags them, and the
-  state stage (`internal/state`, next) will decide what to drop before preflight sees them.
+  The oracle was mutation-tested: nine planted bugs, four in the mapper (a wrong SIDC affiliation, a wrong
+  environment, an empty display name, an expiry clamp of 31 days) and five in the state stage (the out-of-order check
+  reversed, the repeat check removed, the entity limit not enforced, the expiry ignored when holding back an
+  unchanged report, and the change digest including the expiry time), were each caught. The clamp was missed until a
+  seed reached that branch, so the seeds now include a stale time decades out, as static markers send, and a report
+  about to expire. CI runs it for 30 seconds on every push.
+- `takgw serve` is tested end to end: a `cot-gen` scenario on stdin whose output then passes `takgw preflight
+  -strict`, a live TCP connection stopped by cancelling its context, the connection limit, the idle timeout, every
+  usage error, a malformed stream and a failing output.
+
+## State
+
+TAK networks rebroadcast, so the same report can arrive twice and an older one after a newer one. `state.Tracker`
+sits between the mapper and preflight and decides, per entity, whether a report is worth publishing:
+
+- **Ordering.** A report must be newer, by `provenance.sourceUpdateTime`, than the last one published for that
+  entity. A repeat is dropped (the server would discard it anyway), and so is a late arrival, so a track never moves
+  backward.
+- **Change detection.** A newer report that changes nothing but its times is held back until the refresh is due
+  (`-refresh`, 30 seconds by default), unless the published copy would expire within the refresh first. So a
+  stationary unit is republished every 30 seconds, not every few seconds, and never lapses while it keeps reporting.
+  The refresh runs on the gateway's clock.
+- **Recorded only once sent.** The pipeline records an entity in the Tracker only after the publisher accepted it. A
+  report that fails preflight, or whose publish fails, doesn't count as sent, so a rebroadcast of it can still go out.
+  For the same reason preflight runs without history inside the pipeline: the Tracker owns ordering.
+- **Bounded memory.** The Tracker forgets entities whose published expiry has passed, and refuses new ones beyond
+  `-max-entities` (100,000 by default). A full Tracker scans for expired entities at most once a second, so a flood
+  of new uids costs one scan a second, not one per message.
+
+Two things the state stage doesn't do yet: notice the same CoT uid arriving from two different feeds, and tell a TAK
+client that restarted (its clock may jump backward) from a late arrival.

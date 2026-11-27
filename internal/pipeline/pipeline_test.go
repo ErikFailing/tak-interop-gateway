@@ -1,17 +1,19 @@
 package pipeline_test
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
-	"slices"
 	"testing"
 	"time"
 
+	"github.com/erikfailing/tak-interop-gateway/entity"
 	"github.com/erikfailing/tak-interop-gateway/internal/cot"
 	"github.com/erikfailing/tak-interop-gateway/internal/cotgen"
 	"github.com/erikfailing/tak-interop-gateway/internal/mapping"
 	"github.com/erikfailing/tak-interop-gateway/internal/pipeline"
-	"github.com/erikfailing/tak-interop-gateway/preflight"
+	"github.com/erikfailing/tak-interop-gateway/internal/publish"
+	"github.com/erikfailing/tak-interop-gateway/internal/state"
 )
 
 // start is when every test scenario begins.
@@ -20,7 +22,8 @@ var start = time.Date(2026, 11, 27, 16, 0, 0, 0, time.UTC)
 // feed is the mapping config the tests use.
 var feed = mapping.Config{Source: "test-feed", Simulated: true, TrackQuality: mapping.DefaultTrackQuality}
 
-// message builds one valid CoT message: a friendly ground unit reporting at the given time, stale two minutes later.
+// message builds one valid CoT message: a unit of the given type reporting at the given time from a fixed position,
+// stale two minutes later.
 func message(tb testing.TB, uid, typ string, at time.Time) []byte {
 	tb.Helper()
 	b, err := xml.Marshal(cot.Event{
@@ -35,27 +38,20 @@ func message(tb testing.TB, uid, typ string, at time.Time) []byte {
 	return b
 }
 
-// newPipeline returns a pipeline whose clock is whatever *now holds.
-func newPipeline(t *testing.T, now *time.Time) *pipeline.Pipeline {
+// newPipeline returns a pipeline whose clock is whatever *now holds, publishing to the returned in-memory publisher.
+func newPipeline(t *testing.T, now *time.Time, st state.Config) (*pipeline.Pipeline, *publish.Memory) {
 	t.Helper()
-	p, err := pipeline.New(feed, cot.DefaultLimits, func() time.Time { return *now })
+	mem := &publish.Memory{}
+	p, err := pipeline.New(pipeline.Config{Mapping: feed, State: st, Publisher: mem, Clock: func() time.Time { return *now }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return p
+	return p, mem
 }
 
-// ids lists the rule IDs of some violations.
-func ids(vs []preflight.Violation) []string {
-	var out []string
-	for _, v := range vs {
-		out = append(out, v.Rule.ID)
-	}
-	return out
-}
-
-// TestScenarioPublishes runs a cot-gen scenario through one pipeline and requires every message to come out ready to
-// publish, with no findings at all.
+// TestScenarioPublishes runs a cot-gen scenario through one pipeline. The walking team changes every tick, so every
+// member report is published; the last-known-position marker never moves, so after its first publish it is held
+// back until the refresh is due, 30 seconds (six ticks) later.
 func TestScenarioPublishes(t *testing.T) {
 	s, err := cotgen.New(cotgen.Config{
 		Units: 3, Origin: cotgen.LatLon{Lat: 40.3428, Lon: -105.6836}, Start: start,
@@ -65,7 +61,8 @@ func TestScenarioPublishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var now time.Time
-	p := newPipeline(t, &now)
+	p, mem := newPipeline(t, &now, state.Config{})
+	lkpPublished := 0
 	for tick := range 10 {
 		for _, ev := range s.Next() {
 			b, err := xml.Marshal(ev)
@@ -73,46 +70,111 @@ func TestScenarioPublishes(t *testing.T) {
 				t.Fatal(err)
 			}
 			now = time.Time(ev.Start)
-			res, err := p.Process(b)
-			if err != nil || res.Violations != nil {
+			res, err := p.Process(context.Background(), b)
+			switch {
+			case err == nil && res.Violations == nil:
+				if ev.UID == "cotgen-lkp-1" {
+					lkpPublished++
+				}
+			case errors.Is(err, state.ErrUnchanged) && ev.UID == "cotgen-lkp-1":
+			default:
 				t.Fatalf("tick %d, %s: err %v, violations %v", tick, ev.UID, err, res.Violations)
 			}
 		}
 	}
-}
-
-// TestRepeatedReportIsRejected checks that a report repeated with the same time, which TAK networks do when they
-// rebroadcast, is held back: the server would discard it anyway.
-func TestRepeatedReportIsRejected(t *testing.T) {
-	now := start
-	p := newPipeline(t, &now)
-	msg := message(t, "u-1", "a-f-G-U-C", start)
-	if _, err := p.Process(msg); err != nil {
-		t.Fatalf("first report: %v", err)
+	if got, want := len(mem.Entities()), 3*10+2; got != want {
+		t.Errorf("published %d entities, want %d (30 member reports, and the marker at 0 s and 30 s)", got, want)
 	}
-	res, err := p.Process(msg)
-	if !errors.Is(err, pipeline.ErrRejected) {
-		t.Fatalf("repeated report: err %v, want ErrRejected", err)
-	}
-	if res.Entity.EntityID == nil || !slices.Contains(ids(res.Violations), "source-update-time-changes") {
-		t.Errorf("a rejection should still carry the entity and the reason: %+v", res)
+	if lkpPublished != 2 {
+		t.Errorf("the marker was published %d times, want 2", lkpPublished)
 	}
 }
 
-// TestOutOfOrderReportWarns checks that an older report after a newer one is passed with a warning. Dropping it is a
-// state decision, which belongs to the state stage, not to preflight.
-func TestOutOfOrderReportWarns(t *testing.T) {
+// TestStateDrops checks that a repeated report and a late one are dropped before they reach the publisher.
+func TestStateDrops(t *testing.T) {
 	now := start.Add(10 * time.Second)
-	p := newPipeline(t, &now)
-	if _, err := p.Process(message(t, "u-1", "a-f-G-U-C", start.Add(5*time.Second))); err != nil {
+	p, mem := newPipeline(t, &now, state.Config{})
+	ctx := context.Background()
+	later := message(t, "u-1", "a-f-G-U-C", start.Add(5*time.Second))
+	if _, err := p.Process(ctx, later); err != nil {
 		t.Fatal(err)
 	}
-	res, err := p.Process(message(t, "u-1", "a-f-G-U-C", start))
-	if err != nil {
-		t.Fatalf("out-of-order report: %v", err)
+	for _, tt := range []struct {
+		name string
+		msg  []byte
+		want error
+	}{
+		{"repeated", later, state.ErrRepeated},
+		{"out of order", message(t, "u-1", "a-f-G-U-C", start), state.ErrOutOfOrder},
+	} {
+		res, err := p.Process(ctx, tt.msg)
+		if !errors.Is(err, pipeline.ErrDropped) || !errors.Is(err, tt.want) {
+			t.Errorf("%s: err %v, want ErrDropped and %v", tt.name, err, tt.want)
+		}
+		if res.Entity.EntityID == nil {
+			t.Errorf("%s: a dropped report should still carry its entity, for logging", tt.name)
+		}
 	}
-	if got := ids(res.Violations); !slices.Equal(got, []string{"source-update-time-increases"}) {
-		t.Errorf("violations = %v, want only source-update-time-increases", got)
+	if n := len(mem.Entities()); n != 1 {
+		t.Errorf("published %d entities, want 1", n)
+	}
+}
+
+// flaky fails its first publish and accepts the rest.
+type flaky struct {
+	failed bool
+	publish.Memory
+}
+
+func (f *flaky) Publish(ctx context.Context, e entity.Entity) error {
+	if !f.failed {
+		f.failed = true
+		return errors.New("connection reset")
+	}
+	return f.Memory.Publish(ctx, e)
+}
+
+// TestFailedPublishIsNotRecorded checks that a report whose publish failed is not counted as sent: the same report
+// arriving again, as a rebroadcast would, goes out instead of being dropped as a repeat.
+func TestFailedPublishIsNotRecorded(t *testing.T) {
+	pub := &flaky{}
+	p, err := pipeline.New(pipeline.Config{Mapping: feed, Publisher: pub, Clock: func() time.Time { return start }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := message(t, "u-1", "a-f-G-U-C", start)
+	if _, err := p.Process(context.Background(), msg); !errors.Is(err, pipeline.ErrPublish) {
+		t.Fatalf("first attempt: err %v, want ErrPublish", err)
+	}
+	if _, err := p.Process(context.Background(), msg); err != nil {
+		t.Fatalf("second attempt: %v", err)
+	}
+	if n := len(pub.Entities()); n != 1 {
+		t.Errorf("published %d entities, want 1", n)
+	}
+}
+
+// TestRejectedByPreflight checks the preflight gate with a feed whose classification the SDK doesn't know: the mapper
+// can't check it, because it doesn't import the SDK, so preflight is what stops it. takgw serve checks the level at
+// startup with preflight.CheckClassification, so this is the gate for library callers that skip that check.
+func TestRejectedByPreflight(t *testing.T) {
+	cfg := feed
+	cfg.Classification = "SECRET"
+	mem := &publish.Memory{}
+	p, err := pipeline.New(pipeline.Config{Mapping: cfg, Publisher: mem, Clock: func() time.Time { return start }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.Process(context.Background(), message(t, "u-1", "a-f-G-U-C", start))
+	if !errors.Is(err, pipeline.ErrRejected) || len(res.Violations) == 0 || res.Violations[0].Rule.ID != "enum-values" {
+		t.Errorf("err %v, violations %v; want ErrRejected for enum-values", err, res.Violations)
+	}
+	if n := len(mem.Entities()); n != 0 {
+		t.Errorf("published %d entities, want 0", n)
+	}
+	// A rejected report isn't recorded either, so a corrected one can follow.
+	if p.Tracked() != 0 {
+		t.Errorf("Tracked = %d, want 0", p.Tracked())
 	}
 }
 
@@ -130,11 +192,16 @@ func TestStageErrors(t *testing.T) {
 		{"not an atom", message(t, "u-1", "b-m-p-s-p-i", start), pipeline.ErrMap, mapping.ErrNotAnAtom},
 		{"unknown affiliation", message(t, "u-1", "a-q-G", start), pipeline.ErrMap, mapping.ErrUnsupported},
 		{"already stale", message(t, "u-1", "a-f-G", start.Add(-time.Hour)), pipeline.ErrMap, mapping.ErrExpired},
+		{"too many entities", message(t, "u-2", "a-f-G", start), pipeline.ErrDropped, state.ErrFull},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			now := start
-			_, err := newPipeline(t, &now).Process(tt.msg)
+			p, _ := newPipeline(t, &now, state.Config{MaxEntities: 1})
+			if _, err := p.Process(context.Background(), message(t, "u-1", "a-f-G", start)); err != nil {
+				t.Fatal(err) // fills the one slot
+			}
+			_, err := p.Process(context.Background(), tt.msg)
 			if !errors.Is(err, tt.stage) || !errors.Is(err, tt.cause) {
 				t.Errorf("err = %v, want both %v and %v", err, tt.stage, tt.cause)
 			}
@@ -144,25 +211,32 @@ func TestStageErrors(t *testing.T) {
 
 // TestBadConfigFailsAtStartup checks that New, not the first message, reports a bad config.
 func TestBadConfigFailsAtStartup(t *testing.T) {
-	if _, err := pipeline.New(mapping.Config{}, cot.DefaultLimits, time.Now); !errors.Is(err, mapping.ErrConfig) {
-		t.Errorf("New with an empty config: err %v, want ErrConfig", err)
+	mem := &publish.Memory{}
+	if _, err := pipeline.New(pipeline.Config{Publisher: mem}); !errors.Is(err, mapping.ErrConfig) {
+		t.Errorf("empty mapping config: err %v, want mapping.ErrConfig", err)
+	}
+	if _, err := pipeline.New(pipeline.Config{Mapping: feed, Publisher: mem, State: state.Config{MaxEntities: -1}}); !errors.Is(err, state.ErrConfig) {
+		t.Errorf("negative MaxEntities: err %v, want state.ErrConfig", err)
+	}
+	if _, err := pipeline.New(pipeline.Config{Mapping: feed}); err == nil {
+		t.Error("no publisher: want an error")
 	}
 }
 
 // TestClockReadOncePerMessage uses a clock that jumps an hour on every read. A report stale two minutes after it was
-// sent passes only if the mapper and the checker saw the same reading; if the checker read the clock again, the
-// expiry would already be in its past.
+// sent passes only if every stage saw the same reading; if preflight read the clock again, the expiry would already
+// be in its past.
 func TestClockReadOncePerMessage(t *testing.T) {
 	reads := 0
 	clock := func() time.Time {
 		reads++
 		return start.Add(time.Duration(reads-1) * time.Hour)
 	}
-	p, err := pipeline.New(feed, cot.DefaultLimits, clock)
+	p, err := pipeline.New(pipeline.Config{Mapping: feed, Publisher: &publish.Memory{}, Clock: clock})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Process(message(t, "u-1", "a-f-G-U-C", start)); err != nil {
+	if _, err := p.Process(context.Background(), message(t, "u-1", "a-f-G-U-C", start)); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if reads != 1 {

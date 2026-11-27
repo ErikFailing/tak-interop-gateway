@@ -394,6 +394,22 @@ func TestSDKVersionMatchesGoMod(t *testing.T) {
 	}
 }
 
+// TestCheckClassification checks the startup check a gateway runs on its configured level.
+func TestCheckClassification(t *testing.T) {
+	for level, ok := range map[entity.ClassificationLevel]bool{
+		entity.ClassificationUnclassified:               true,
+		"CLASSIFICATION_LEVELS_CONTROLLED_UNCLASSIFIED": true,
+		"UNCLASSIFIED":                       false,
+		"CLASSIFICATION_LEVELS_INVALID":      false,
+		"":                                   false,
+		"classification_levels_unclassified": false,
+	} {
+		if err := preflight.CheckClassification(level); (err == nil) != ok {
+			t.Errorf("CheckClassification(%q) = %v, want ok=%v", level, err, ok)
+		}
+	}
+}
+
 // TestViolationString pins the format the CLI prints.
 func TestViolationString(t *testing.T) {
 	e := goodTrack()

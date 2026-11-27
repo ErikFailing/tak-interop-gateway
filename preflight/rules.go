@@ -312,6 +312,18 @@ func checkEnums(_ *Checker, e entity.Entity, _ time.Time) []finding {
 	return out
 }
 
+// CheckClassification returns an error if level is not a classification level the installed SDK knows, or is the
+// INVALID sentinel. A gateway can check its configured level once at startup this way, instead of having every entity
+// rejected later by the enum-values rule.
+func CheckClassification(level entity.ClassificationLevel) error {
+	fs := checkEnum("dataClassification.default.level", string(level), lattice.NewClassificationInformationLevelFromString,
+		lattice.ClassificationInformationLevelClassificationLevelsInvalid)
+	if fs != nil {
+		return fmt.Errorf("preflight: classification level %s", fs[0].detail)
+	}
+	return nil
+}
+
 // checkEnum checks one enum value with the SDK constructor parse, and against sentinel when the enum has one.
 func checkEnum[T ~string](field, value string, parse func(string) (T, error), sentinel T) []finding {
 	v, err := parse(value)

@@ -4,20 +4,44 @@ A gateway that translates TAK Cursor-on-Target (CoT) traffic into entities for t
 validator, Entity Preflight, that checks every entity against the platform's documented acceptance rules before it is
 sent.
 
-> **Status: early development.** Working today: the CoT parser and stream framer, the CoT-to-entity mapper, the
-> offline pipeline that ties them to Entity Preflight, `takgw preflight`, and the `cot-gen` test-data generator.
-> `takgw serve` and `takgw readback` are not implemented yet.
+> **Status: early development.** The gateway runs end to end offline: `takgw serve` reads CoT from stdin or TCP,
+> maps it, filters it, checks it with Entity Preflight, and writes the entities as JSON lines. Publishing to Lattice
+> through the SDK, TLS with client certificates, and `takgw readback` are not implemented yet.
 
 ## Components
 
 One binary, `takgw`, with three commands:
 
-- `takgw serve` (planned): the gateway. Reads CoT from a TAK server or client, maps each event to an entity, validates
-  it and publishes it.
+- `takgw serve`: the gateway. Reads CoT from stdin or plain TCP, maps each event to an entity, drops repeats, late
+  arrivals and unchanged reports, checks what's left with Entity Preflight, and publishes it. For now it publishes
+  offline, as JSON lines; the Lattice SDK adapter is next.
 - `takgw preflight`: Entity Preflight as a standalone tool. Reads entity JSON and reports any entity that breaks a
   documented rule, so other integrations can run it in their own CI.
 - `takgw readback` (planned): a round-trip check. Publishes the project's own test entities and confirms that what
   comes back matches what was sent.
+
+## Running the gateway offline
+
+`serve`'s output is `preflight`'s input, so the whole path can be checked with no Lattice environment:
+
+```console
+$ go run ./cmd/cot-gen -ticks 10 | go run ./cmd/takgw serve -stdin -source demo -simulated | go run ./cmd/takgw preflight -strict
+takgw serve: 50 messages: 41 published, 9 dropped (unchanged 9), 0 unparsable, 0 unmappable, 0 rejected by preflight, 0 publish errors, 0 stream errors; 5 entities tracked
+takgw preflight: 41 entities checked: 0 errors, 0 warnings, 0 unreadable
+```
+
+The walkers move every tick, so each of their reports is published. The last-known-position marker never moves, so
+after its first publish it is held back until the 30-second refresh is due, on the gateway's clock. Over TCP, in real
+time:
+
+```bash
+go run ./cmd/takgw serve -listen 127.0.0.1:8087 -source demo -simulated -out entities.jsonl   # Ctrl-C to stop
+go run ./cmd/cot-gen -tcp 127.0.0.1:8087 -realtime -ticks 0                                   # in another terminal
+```
+
+`-listen` takes plain TCP with no authentication, so anyone who can reach the port can inject tracks: bind it to a
+loopback address or a trusted network (serve warns when it isn't loopback). `-source` names the feed and is part of
+every entity ID, so keep it stable. Pass `-simulated` for test data. Run `takgw serve -h` for every flag.
 
 ## Entity Preflight
 
@@ -46,8 +70,11 @@ Passing preflight is necessary, not sufficient: the documentation can lag the se
 
 ## Design
 
-- **Ports and adapters.** A pure core (parsing, mapping, validation, state) with the network at the edges, so the core
-  can be fuzzed and tested without a live environment.
+- **Ports and adapters.** A pure core (parsing, mapping, state, validation) with the network at the edges, so the core
+  can be fuzzed and tested without a live environment. The offline publisher runs the same code path a real deployment
+  will.
+- **Bounded by design.** Frame size, XML depth and element count, queued messages, concurrent connections, idle
+  connections and tracked entities all have limits, so a hostile or broken feed can't exhaust memory.
 - **A narrow SDK boundary.** The official Lattice Go SDK is imported only by Entity Preflight, which asks it for enum
   values and field names, and by the publish adapter. A depguard lint rule enforces this. No SDK code, generated stubs
   or `.proto` files are committed to this repository.
@@ -78,10 +105,11 @@ go test -run='^$' -fuzz=FuzzPipeline ./internal/pipeline
 - `FuzzMap` checks that every entity the mapper returns holds its invariants and survives a JSON round trip.
 - `FuzzCheckJSON` checks that Entity Preflight never panics on arbitrary input, refuses what it can't read with a
   typed error, and gives the same answer every time.
-- `FuzzPipeline` is the end-to-end oracle. It feeds a fuzzed TCP stream through the framer, parser, mapper and Entity
-  Preflight, and checks what comes out, not just that nothing crashed: every entity the gateway would publish must pass
-  preflight cleanly, both as a value and as JSON. Planting bugs in the mapper (a wrong SIDC letter, a wrong
-  environment, an empty name, an expiry clamp past 30 days) confirmed that it catches each one.
+- `FuzzPipeline` is the end-to-end oracle. It feeds a fuzzed TCP stream through the framer, parser, mapper, state
+  stage, Entity Preflight and an in-memory publisher, and checks what comes out, not just that nothing crashed: every
+  entity published must pass preflight cleanly, both as a value and as JSON, and every publish-or-drop decision must
+  match an independent reference model of the state policy. Planting nine bugs, four in the mapper and five in the
+  state stage, confirmed that it catches each one.
 
 Failing inputs are saved under each package's `testdata/fuzz/` and replayed by plain `go test` from then on.
 
