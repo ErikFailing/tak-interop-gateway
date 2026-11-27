@@ -31,10 +31,33 @@ Keeping the core free of network and SDK code means:
 | `readback` | Round-trip verification of the project's own test entities. Public. |
 | `internal/transport` | `Framer`: splits a TCP stream into one size-limited message per event, using the parser's own tokenizer. Connections to TAK servers and clients (TCP, TLS with client certificates) are still to come. |
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
-| `internal/mapping` | CoT event to candidate entity: identity, MIL-STD-2525C symbology, location, expiry, provenance |
+| `entity` | An SDK-free model of the Lattice entity fields this project sets, with the REST API's JSON field names. Public, so Entity Preflight and other Go projects can use it. |
+| `internal/mapping` | CoT event to candidate entity. See the mapping table below. |
 | `internal/state` | Per-entity source update times, change detection, cross-source ID collision checks |
 | `internal/publish` | The `Publisher` interface, with an SDK adapter and an in-process fake |
 | `internal/health` | Publishes the gateway itself as an asset with a health component |
+
+## Mapping
+
+`mapping.Map` turns one parsed CoT event into an `entity.Entity`. It takes the current time as a parameter, so it is
+deterministic, and it refuses rather than guesses when an event doesn't map cleanly.
+
+| CoT | Entity field | Notes |
+|---|---|---|
+| feed name + `uid` | `entityId` | A UUIDv5 under this project's fixed namespace, so it is the same on every republish |
+| affiliation letter in `type` | `milView.disposition` | `f` friendly, `a` assumed friendly, `n` neutral, `u`/`o`/`x` unknown, `p` pending, `s` suspicious, `h` hostile. The 2525 exercise identities joker (`j`) and faker (`k`) map to suspicious and hostile, with `indicators.exercise` set. Any other letter is refused. |
+| battle dimension letter in `type` | `milView.environment` | `P` space, `A` air, `G`/`F` land, `S` surface, `U` sub-surface, `X`/`Z` unknown. Any other letter is refused. |
+| the whole `type` | `symbology.milStd2525C.sidc` | Transliterated: `a-f-G-U-C` becomes `SFGPUC---------`. Left out when the type doesn't transliterate cleanly. |
+| `type` | `ontology.platformType` | `ontology.template` is always `TEMPLATE_TRACK` |
+| `stale` | `expiryTime` | An already-stale event is refused. An expiry 30 days or more out is clamped to just under 30 days. |
+| `point` lat, lon, hae | `location.position` | Altitude only when `hae` isn't the 9999999 "unknown" value |
+| `point` `ce` | `locationUncertainty.positionErrorEllipse` | A circle of radius `ce`. Probability is left unset: producers don't agree on what confidence `ce` represents. |
+| `detail/track` course, speed | `location.velocityEnu` | East and north only. Up is left unset rather than claimed as zero. |
+| `detail/contact` callsign | `aliases.name` | Falls back to the `uid`, because the server requires a non-empty name |
+| `uid`, `time`, feed name | `provenance` | `integrationName` `tak-interop-gateway`, `dataType` `cot`, `sourceId`, `sourceUpdateTime`, `sourceDescription` |
+| (per feed) | `indicators.simulated`, `tracked.trackQualityWrapper` | Set from the feed's config. Track quality is a policy choice; CoT has nothing to derive it from. |
+
+Only atom events (types starting `a-`) become entities. Chat, drawings and other types are refused for now.
 
 ## Testing
 
@@ -53,5 +76,14 @@ Keeping the core free of network and SDK code means:
   - any frame the parser accepts frames back to exactly itself.
 
   CI runs it for 30 seconds on every push.
+- `FuzzMap` (in `internal/mapping`) feeds parser-accepted events to the mapper. It checks:
+  - `Map` never panics;
+  - every result has a well-formed UUIDv5, an expiry within bounds, a name, the event's own position and a valid or
+    absent SIDC;
+  - its JSON survives a round trip unchanged.
+
+  CI runs it for 30 seconds on every push.
+- The mapper's UUIDv5 code is checked against the RFC 9562 example and against IDs computed independently with
+  Python's `uuid` module. A JSON golden test pins the exact wire shape.
 - The pipeline fuzz oracle will go beyond "does not crash": every entity the pipeline emits must also pass Entity
   Preflight.

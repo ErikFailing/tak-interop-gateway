@@ -37,6 +37,8 @@ jobs:
         run: go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/cot
       - name: fuzz smoke (FuzzFramer, 30s)
         run: go test -run='^$' -fuzz=FuzzFramer -fuzztime=30s ./internal/transport
+      - name: fuzz smoke (FuzzMap, 30s)
+        run: go test -run='^$' -fuzz=FuzzMap -fuzztime=30s ./internal/mapping
 
   lint:
     runs-on: ubuntu-latest
