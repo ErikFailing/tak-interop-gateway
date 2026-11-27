@@ -1,0 +1,14 @@
+# Build output
+/takgw
+/takgw.exe
+/dist/
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Local credentials and environment files: never commit these
+.env
+.env.*
+!.env.example
