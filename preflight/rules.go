@@ -121,7 +121,7 @@ var rules = []rule{
 	}, checkDisplayName},
 	{Rule{
 		ID: "enum-values", Severity: Error,
-		Summary: "milView.disposition, milView.environment, ontology.template and dataClassification.default.level are values the installed SDK knows, and not an INVALID sentinel. The server rejects an unknown value with UNMARSHAL_ERROR.",
+		Summary: "Every enum field the model carries (milView disposition and environment, ontology.template, the classification level, and an asset's health and sensor statuses and sensor types) holds a value the installed SDK knows, and not an INVALID sentinel. The server rejects an unknown value with UNMARSHAL_ERROR.",
 		Sources: []Source{srcEnumTrap, srcChoosingValues, srcSDKTypes},
 	}, checkEnums},
 	{Rule{
@@ -185,9 +185,19 @@ var rules = []rule{
 		Sources: []Source{srcChecklist, srcClassification},
 	}, checkClassificationSet},
 	{Rule{
+		ID: "asset-health-set", Severity: Warning,
+		Summary: "A TEMPLATE_ASSET entity sets health.healthStatus and health.connectionStatus. The guide's checklist says always.",
+		Sources: []Source{srcChecklist, srcAssetFields},
+	}, checkAssetHealth},
+	{Rule{
+		ID: "asset-sensors-set", Severity: Warning,
+		Summary: "A TEMPLATE_ASSET entity declares at least one sensor with a sensorType. The guide's checklist says always: at least the asset's primary sensing capability.",
+		Sources: []Source{srcChecklist, srcAssetFields},
+	}, checkAssetSensors},
+	{Rule{
 		ID: "unchecked-template-rules", Severity: Info,
-		Summary: "TEMPLATE_GEO and TEMPLATE_ASSET have requirements this checker does not model (geoDetails and geoShape; health and sensors), so those were not checked.",
-		Sources: []Source{srcByTemplate, srcAssetFields},
+		Summary: "TEMPLATE_GEO needs geoDetails and geoShape, which this checker does not model, so those were not checked.",
+		Sources: []Source{srcByTemplate},
 	}, checkUncheckedTemplates},
 }
 
@@ -308,6 +318,36 @@ func checkEnums(_ *Checker, e entity.Entity, _ time.Time) []finding {
 	}
 	if c := e.DataClassification; c != nil && c.Default != nil && c.Default.Level != nil {
 		out = append(out, checkEnum("dataClassification.default.level", string(*c.Default.Level), lattice.NewClassificationInformationLevelFromString, lattice.ClassificationInformationLevelClassificationLevelsInvalid)...)
+	}
+
+	// 3: An asset's health and sensors carry their own enums, every one with an INVALID sentinel.
+	if h := e.Health; h != nil {
+		if h.HealthStatus != nil {
+			out = append(out, checkEnum("health.healthStatus", string(*h.HealthStatus), lattice.NewHealthHealthStatusFromString, lattice.HealthHealthStatusHealthStatusInvalid)...)
+		}
+		if h.ConnectionStatus != nil {
+			out = append(out, checkEnum("health.connectionStatus", string(*h.ConnectionStatus), lattice.NewHealthConnectionStatusFromString, lattice.HealthConnectionStatusConnectionStatusInvalid)...)
+		}
+		for i, c := range h.Components {
+			if c.Health != nil {
+				out = append(out, checkEnum(fmt.Sprintf("health.components[%d].health", i), string(*c.Health), lattice.NewComponentHealthHealthFromString, lattice.ComponentHealthHealthHealthStatusInvalid)...)
+			}
+			for j, m := range c.Messages {
+				if m.Status != nil {
+					out = append(out, checkEnum(fmt.Sprintf("health.components[%d].messages[%d].status", i, j), string(*m.Status), lattice.NewComponentMessageStatusFromString, lattice.ComponentMessageStatusHealthStatusInvalid)...)
+				}
+			}
+		}
+	}
+	if s := e.Sensors; s != nil {
+		for i, sensor := range s.Sensors {
+			if sensor.SensorType != nil {
+				out = append(out, checkEnum(fmt.Sprintf("sensors.sensors[%d].sensorType", i), string(*sensor.SensorType), lattice.NewSensorSensorTypeFromString, lattice.SensorSensorTypeSensorTypeInvalid)...)
+			}
+			if sensor.OperationalState != nil {
+				out = append(out, checkEnum(fmt.Sprintf("sensors.sensors[%d].operationalState", i), string(*sensor.OperationalState), lattice.NewSensorOperationalStateFromString, lattice.SensorOperationalStateOperationalStateInvalid)...)
+			}
+		}
 	}
 	return out
 }
@@ -540,12 +580,37 @@ func checkClassificationSet(_ *Checker, e entity.Entity, _ time.Time) []finding 
 	return nil
 }
 
+func checkAssetHealth(_ *Checker, e entity.Entity, _ time.Time) []finding {
+	if template(e) != entity.TemplateAsset {
+		return nil
+	}
+	var out []finding
+	if e.Health == nil || e.Health.HealthStatus == nil {
+		out = append(out, finding{"health.healthStatus", "is not set on a TEMPLATE_ASSET entity"})
+	}
+	if e.Health == nil || e.Health.ConnectionStatus == nil {
+		out = append(out, finding{"health.connectionStatus", "is not set on a TEMPLATE_ASSET entity"})
+	}
+	return out
+}
+
+func checkAssetSensors(_ *Checker, e entity.Entity, _ time.Time) []finding {
+	if template(e) != entity.TemplateAsset {
+		return nil
+	}
+	if e.Sensors != nil {
+		for _, s := range e.Sensors.Sensors {
+			if s.SensorType != nil {
+				return nil
+			}
+		}
+	}
+	return found("sensors.sensors", "no sensor with a sensorType on a TEMPLATE_ASSET entity")
+}
+
 func checkUncheckedTemplates(_ *Checker, e entity.Entity, _ time.Time) []finding {
-	switch template(e) {
-	case entity.TemplateGeo:
+	if template(e) == entity.TemplateGeo {
 		return found("ontology.template", "TEMPLATE_GEO also needs geoDetails and geoShape (and location for an ellipse), which this checker does not model")
-	case entity.TemplateAsset:
-		return found("ontology.template", "TEMPLATE_ASSET should also carry health.healthStatus, health.connectionStatus and sensors, which this checker does not model")
 	}
 	return nil
 }

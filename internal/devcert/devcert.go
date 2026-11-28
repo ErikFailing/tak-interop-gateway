@@ -1,4 +1,4 @@
-// Package devcert writes a throwaway certificate authority, a server certificate and a client certificate, for trying
+// Package devcert writes a throwaway certificate authority, a server certificate and two client certificates, for trying
 // and testing the gateway's mutual TLS locally. It is not for production: the keys are written unencrypted, the
 // certificates last 30 days, and nothing else trusts the authority. A real deployment uses certificates issued by its
 // TAK server's own authority.
@@ -26,9 +26,13 @@ const Validity = 30 * 24 * time.Hour
 // Files are the paths Generate wrote.
 type Files struct {
 	CA, ServerCert, ServerKey, ClientCert, ClientKey string
+	// IntruderCert and IntruderKey are a second client identity from the same authority, for showing that one
+	// client can't take over another's tracks.
+	IntruderCert, IntruderKey string
 }
 
-// Generate writes ca.pem, server.pem, server.key, client.pem and client.key into dir, which it creates if needed. The
+// Generate writes ca.pem, server.pem, server.key, client.pem, client.key, intruder.pem and intruder.key into dir, which
+// it creates if needed. The
 // server certificate is valid for hosts, each a DNS name or an IP address. Generate never overwrites a file: if any
 // already exists, it writes nothing and returns an error.
 func Generate(dir string, hosts []string, now time.Time) (Files, error) {
@@ -36,11 +40,12 @@ func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 	f := Files{
 		CA: filepath.Join(dir, "ca.pem"), ServerCert: filepath.Join(dir, "server.pem"), ServerKey: filepath.Join(dir, "server.key"),
 		ClientCert: filepath.Join(dir, "client.pem"), ClientKey: filepath.Join(dir, "client.key"),
+		IntruderCert: filepath.Join(dir, "intruder.pem"), IntruderKey: filepath.Join(dir, "intruder.key"),
 	}
 	if len(hosts) == 0 {
 		return Files{}, errors.New("devcert: the server certificate needs at least one host")
 	}
-	for _, p := range []string{f.CA, f.ServerCert, f.ServerKey, f.ClientCert, f.ClientKey} {
+	for _, p := range []string{f.CA, f.ServerCert, f.ServerKey, f.ClientCert, f.ClientKey, f.IntruderCert, f.IntruderKey} {
 		if _, err := os.Stat(p); err == nil {
 			return Files{}, fmt.Errorf("devcert: %s already exists; not overwriting", p)
 		}
@@ -85,13 +90,20 @@ func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 	if err != nil {
 		return Files{}, err
 	}
-	clientKey, clientDER, err := issue(&x509.Certificate{
-		Subject:     pkix.Name{CommonName: "takgw-dev-client"},
-		NotBefore:   notBefore,
-		NotAfter:    notAfter,
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}, caCert, caKey)
+	client := func(name string) (*ecdsa.PrivateKey, []byte, error) {
+		return issue(&x509.Certificate{
+			Subject:     pkix.Name{CommonName: name},
+			NotBefore:   notBefore,
+			NotAfter:    notAfter,
+			KeyUsage:    x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		}, caCert, caKey)
+	}
+	clientKey, clientDER, err := client("takgw-dev-client")
+	if err != nil {
+		return Files{}, err
+	}
+	intruderKey, intruderDER, err := client("takgw-dev-intruder")
 	if err != nil {
 		return Files{}, err
 	}
@@ -107,6 +119,8 @@ func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 		{f.ServerKey, "PRIVATE KEY", serverKey, 0o600},
 		{f.ClientCert, "CERTIFICATE", clientDER, 0o644},
 		{f.ClientKey, "PRIVATE KEY", clientKey, 0o600},
+		{f.IntruderCert, "CERTIFICATE", intruderDER, 0o644},
+		{f.IntruderKey, "PRIVATE KEY", intruderKey, 0o600},
 	} {
 		if err := writePEM(w.path, w.kind, w.value, w.mode); err != nil {
 			return Files{}, err

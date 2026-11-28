@@ -14,8 +14,8 @@ import (
 // devcertsUsage heads the flag list for `takgw devcerts -h`.
 const devcertsUsage = `usage: takgw devcerts [-dir DIR] [-hosts NAMES]
 
-Writes a throwaway certificate authority, a server certificate and a client certificate, for trying mutual TLS
-locally between takgw serve and cot-gen. Not for production: the keys are unencrypted, the certificates last 30 days,
+Writes a throwaway certificate authority, a server certificate and two client certificates, for trying mutual TLS
+locally between takgw serve, cot-gen and hostile-sender. Not for production: the keys are unencrypted, the certificates last 30 days,
 and nothing else trusts the authority. A real deployment uses certificates from its TAK server's authority. Existing
 files are never overwritten.
 
@@ -57,11 +57,15 @@ func runDevcerts(args []string, stdout, stderr io.Writer) int {
   authority  %s
   server     %s  %s  (for %s)
   client     %s  %s
+  intruder   %s  %s  (a second identity, for hostile-sender's impersonation case)
 
 try them:
   takgw serve -source demo -simulated -listen 127.0.0.1:8089 -tls-cert %s -tls-key %s -tls-ca %s
   cot-gen -tcp 127.0.0.1:8089 -realtime -ticks 0 -tls-cert %s -tls-key %s -tls-ca %s
+  hostile-sender -tcp 127.0.0.1:8089 -tls-cert %s -tls-key %s -tls-ca %s -intruder-cert %s -intruder-key %s
 `, *dir, f.CA, f.ServerCert, f.ServerKey, strings.Join(names, ", "), f.ClientCert, f.ClientKey,
-		f.ServerCert, f.ServerKey, f.CA, f.ClientCert, f.ClientKey, f.CA)
+		f.IntruderCert, f.IntruderKey,
+		f.ServerCert, f.ServerKey, f.CA, f.ClientCert, f.ClientKey, f.CA,
+		f.ClientCert, f.ClientKey, f.CA, f.IntruderCert, f.IntruderKey)
 	return 0
 }

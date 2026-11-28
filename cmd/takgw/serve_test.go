@@ -254,7 +254,7 @@ func closedByServer(conn net.Conn) bool {
 
 // TestConnectionLimit checks that a connection beyond -max-conns is closed at once.
 func TestConnectionLimit(t *testing.T) {
-	frames := make(chan []byte, 8)
+	frames := make(chan frame, 8)
 	s := &server{log: slog.New(slog.DiscardHandler), frames: frames, maxConns: 1, idleTimeout: time.Minute}
 	addr, stop := startAcceptLoop(t, s)
 	defer stop()
@@ -280,7 +280,7 @@ func TestConnectionLimit(t *testing.T) {
 
 // TestIdleTimeout checks that a connection that sends nothing is closed after -idle-timeout.
 func TestIdleTimeout(t *testing.T) {
-	s := &server{log: slog.New(slog.DiscardHandler), frames: make(chan []byte, 8), maxConns: 4, idleTimeout: 100 * time.Millisecond}
+	s := &server{log: slog.New(slog.DiscardHandler), frames: make(chan frame, 8), maxConns: 4, idleTimeout: 100 * time.Millisecond}
 	addr, stop := startAcceptLoop(t, s)
 	defer stop()
 	conn, err := net.Dial("tcp", addr)

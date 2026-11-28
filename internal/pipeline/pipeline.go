@@ -1,5 +1,6 @@
 // Package pipeline is the gateway's path for one CoT message: parse it, map it to a candidate entity, let the state
-// stage drop repeats, late arrivals and unchanged reports, check what's left with Entity Preflight, and publish it.
+// stage drop repeats, late arrivals, unchanged reports, implausible jumps and other origins' claims, check what's left
+// with Entity Preflight, and publish it.
 // It has no network and no SDK of its own (the Publisher is passed in), so the whole path can be fuzzed with the
 // in-memory publisher (FuzzPipeline) and then run unchanged by `takgw serve`.
 package pipeline
@@ -88,8 +89,10 @@ func (p *Pipeline) Tracked() int {
 }
 
 // Process takes one framed CoT message all the way to the publisher. It returns nil once the entity has been
-// published, and otherwise an error naming the stage that stopped it.
-func (p *Pipeline) Process(ctx context.Context, msg []byte) (Result, error) {
+// published, and otherwise an error naming the stage that stopped it. origin says where the message came from, such
+// as the client certificate of its connection: the state stage binds each entity to the origin it is published from,
+// so another origin can't take over a live track.
+func (p *Pipeline) Process(ctx context.Context, msg []byte, origin string) (Result, error) {
 	// 1: One clock reading for the whole message. Every stage gets this same time: reading the clock again would let
 	// a report that goes stale between mapping and checking pass one stage and fail the next.
 	at := p.clock()
@@ -105,8 +108,9 @@ func (p *Pipeline) Process(ctx context.Context, msg []byte) (Result, error) {
 	}
 	res := Result{Entity: e}
 
-	// 3: Let the state stage drop repeats, late arrivals and unchanged reports before anything is checked or sent.
-	if err := p.state.Admit(e, at); err != nil {
+	// 3: Let the state stage drop repeats, late arrivals, unchanged reports, implausible jumps and other origins'
+	// claims before anything is checked or sent.
+	if err := p.state.Admit(e, origin, at); err != nil {
 		return res, fmt.Errorf("%w: %w", ErrDropped, err)
 	}
 
@@ -125,6 +129,6 @@ func (p *Pipeline) Process(ctx context.Context, msg []byte) (Result, error) {
 	if err := p.pub.Publish(ctx, e); err != nil {
 		return res, fmt.Errorf("%w: %w", ErrPublish, err)
 	}
-	p.state.Record(e, at)
+	p.state.Record(e, origin, at)
 	return res, nil
 }

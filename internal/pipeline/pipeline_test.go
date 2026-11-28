@@ -70,7 +70,7 @@ func TestScenarioPublishes(t *testing.T) {
 				t.Fatal(err)
 			}
 			now = time.Time(ev.Start)
-			res, err := p.Process(context.Background(), b)
+			res, err := p.Process(context.Background(), b, "feed")
 			switch {
 			case err == nil && res.Violations == nil:
 				if ev.UID == "cotgen-lkp-1" {
@@ -96,7 +96,7 @@ func TestStateDrops(t *testing.T) {
 	p, mem := newPipeline(t, &now, state.Config{})
 	ctx := context.Background()
 	later := message(t, "u-1", "a-f-G-U-C", start.Add(5*time.Second))
-	if _, err := p.Process(ctx, later); err != nil {
+	if _, err := p.Process(ctx, later, "feed"); err != nil {
 		t.Fatal(err)
 	}
 	for _, tt := range []struct {
@@ -107,7 +107,7 @@ func TestStateDrops(t *testing.T) {
 		{"repeated", later, state.ErrRepeated},
 		{"out of order", message(t, "u-1", "a-f-G-U-C", start), state.ErrOutOfOrder},
 	} {
-		res, err := p.Process(ctx, tt.msg)
+		res, err := p.Process(ctx, tt.msg, "feed")
 		if !errors.Is(err, pipeline.ErrDropped) || !errors.Is(err, tt.want) {
 			t.Errorf("%s: err %v, want ErrDropped and %v", tt.name, err, tt.want)
 		}
@@ -143,10 +143,10 @@ func TestFailedPublishIsNotRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := message(t, "u-1", "a-f-G-U-C", start)
-	if _, err := p.Process(context.Background(), msg); !errors.Is(err, pipeline.ErrPublish) {
+	if _, err := p.Process(context.Background(), msg, "feed"); !errors.Is(err, pipeline.ErrPublish) {
 		t.Fatalf("first attempt: err %v, want ErrPublish", err)
 	}
-	if _, err := p.Process(context.Background(), msg); err != nil {
+	if _, err := p.Process(context.Background(), msg, "feed"); err != nil {
 		t.Fatalf("second attempt: %v", err)
 	}
 	if n := len(pub.Entities()); n != 1 {
@@ -165,7 +165,7 @@ func TestRejectedByPreflight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := p.Process(context.Background(), message(t, "u-1", "a-f-G-U-C", start))
+	res, err := p.Process(context.Background(), message(t, "u-1", "a-f-G-U-C", start), "feed")
 	if !errors.Is(err, pipeline.ErrRejected) || len(res.Violations) == 0 || res.Violations[0].Rule.ID != "enum-values" {
 		t.Errorf("err %v, violations %v; want ErrRejected for enum-values", err, res.Violations)
 	}
@@ -198,14 +198,43 @@ func TestStageErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			now := start
 			p, _ := newPipeline(t, &now, state.Config{MaxEntities: 1})
-			if _, err := p.Process(context.Background(), message(t, "u-1", "a-f-G", start)); err != nil {
+			if _, err := p.Process(context.Background(), message(t, "u-1", "a-f-G", start), "feed"); err != nil {
 				t.Fatal(err) // fills the one slot
 			}
-			_, err := p.Process(context.Background(), tt.msg)
+			_, err := p.Process(context.Background(), tt.msg, "feed")
 			if !errors.Is(err, tt.stage) || !errors.Is(err, tt.cause) {
 				t.Errorf("err = %v, want both %v and %v", err, tt.stage, tt.cause)
 			}
 		})
+	}
+}
+
+// TestIntegrityDrops checks the two feed-integrity drops end to end: a ground unit 70 km away a second later, and
+// another origin claiming a live track.
+func TestIntegrityDrops(t *testing.T) {
+	now := start.Add(time.Second)
+	p, mem := newPipeline(t, &now, state.Config{})
+	ctx := context.Background()
+	if _, err := p.Process(ctx, message(t, "u-1", "a-f-G-U-C", start), "unit-a"); err != nil {
+		t.Fatal(err)
+	}
+	var jump cot.Event
+	if err := xml.Unmarshal(message(t, "u-1", "a-f-G-U-C", start.Add(time.Second)), &jump); err != nil {
+		t.Fatal(err)
+	}
+	jump.Point.Lat += 0.63
+	far, err := xml.Marshal(jump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Process(ctx, far, "unit-a"); !errors.Is(err, pipeline.ErrDropped) || !errors.Is(err, state.ErrImplausible) {
+		t.Errorf("teleport: err %v, want ErrDropped and ErrImplausible", err)
+	}
+	if _, err := p.Process(ctx, message(t, "u-1", "a-f-G-U-C", start.Add(2*time.Second)), "intruder"); !errors.Is(err, state.ErrOriginConflict) {
+		t.Errorf("impersonation: err %v, want ErrOriginConflict", err)
+	}
+	if n := len(mem.Entities()); n != 1 {
+		t.Errorf("published %d entities, want only the first report", n)
 	}
 }
 
@@ -236,7 +265,7 @@ func TestClockReadOncePerMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Process(context.Background(), message(t, "u-1", "a-f-G-U-C", start)); err != nil {
+	if _, err := p.Process(context.Background(), message(t, "u-1", "a-f-G-U-C", start), "feed"); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if reads != 1 {

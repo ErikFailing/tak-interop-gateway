@@ -38,7 +38,7 @@ func testConfig() Config {
 // the RFC 9562 example, and this project's own ID scheme.
 func TestUUIDv5KnownAnswers(t *testing.T) {
 	dns := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
-	if got, want := uuidV5(dns, "www.example.com"), "2ed6657d-e927-568b-95e1-2665a8aea6a2"; got != want {
+	if got, want := UUIDv5(dns, "www.example.com"), "2ed6657d-e927-568b-95e1-2665a8aea6a2"; got != want {
 		t.Errorf("RFC example: got %s, want %s", got, want)
 	}
 	tests := []struct{ source, uid, want string }{

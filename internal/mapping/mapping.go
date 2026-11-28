@@ -276,12 +276,12 @@ func location(ev cot.Event) *entity.Location {
 // entityID derives a deterministic UUIDv5 from the feed and the CoT uid. The NUL separator keeps ("ab", "c") and
 // ("a", "bc") apart; neither part can contain one, since both are checked for control characters.
 func entityID(source, uid string) string {
-	return uuidV5(namespace, source+"\x00"+uid)
+	return UUIDv5(namespace, source+"\x00"+uid)
 }
 
-// uuidV5 implements RFC 9562 section 5.5: the first 16 bytes of SHA-1(namespace || name), with the version and variant
+// UUIDv5 implements RFC 9562 section 5.5: the first 16 bytes of SHA-1(namespace || name), with the version and variant
 // bits set. SHA-1 is what the RFC specifies for version 5; it is used here for stable naming, not for security.
-func uuidV5(ns [16]byte, name string) string {
+func UUIDv5(ns [16]byte, name string) string {
 	h := sha1.New()
 	h.Write(ns[:])
 	h.Write([]byte(name))

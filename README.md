@@ -5,24 +5,30 @@ validator, Entity Preflight, that checks every entity against the platform's doc
 sent.
 
 > **Status: early development.** The whole path works: `takgw serve` reads CoT from stdin, from TAK clients
-> connecting in (plain TCP or mutual TLS), or from a TAK server it connects to over mutual TLS; maps it, filters it,
-> checks it with Entity Preflight, and publishes it, as JSON lines or to Lattice through the official Go SDK; and
-> `takgw readback` checks what the platform stored. The Lattice side is tested against an in-process fake of its REST
-> API, and the TAK side against local TLS stand-ins; neither has yet been run against a live system.
+> connecting in (plain TCP or mutual TLS), or from a TAK server it connects to over mutual TLS; maps it, filters out
+> repeats, late arrivals, impossible jumps and impersonation, checks it with Entity Preflight, and publishes it, as
+> JSON lines or to Lattice through the official Go SDK, alongside an asset for the gateway itself that shows whether
+> its feed can be trusted; and `takgw readback` checks what the platform stored. The Lattice side is tested against an
+> in-process fake of its REST API, and the TAK side against local TLS stand-ins; neither has yet been run against a
+> live system.
 
 ## Components
 
-One binary, `takgw`, with three commands:
+One binary, `takgw`, with four commands, and two test tools:
 
 - `takgw serve`: the gateway. Reads CoT from stdin, a listener (plain TCP or mutual TLS), or a TAK server's
-  streaming TLS port, maps each event to an entity, drops repeats, late arrivals and unchanged reports, checks what's
-  left with Entity Preflight, and publishes it: as JSON lines by default, or to a Lattice environment with `-lattice`.
+  streaming TLS port, maps each event to an entity, drops repeats, late arrivals, unchanged reports, physically
+  impossible jumps and other senders' claims on live tracks, checks what's left with Entity Preflight, and publishes
+  it: as JSON lines by default, or to a Lattice environment with `-lattice`. With `-health-position` it also publishes
+  itself as an asset.
 - `takgw preflight`: Entity Preflight as a standalone tool. Reads entity JSON and reports any entity that breaks a
   documented rule, so other integrations can run it in their own CI.
 - `takgw readback`: a round-trip check. Publishes the project's own simulated test entities, reads each back in a
   separate request, and reports any field the platform dropped or changed.
-- `takgw devcerts`: writes a throwaway certificate authority, server and client certificate for trying mutual TLS
-  locally. Not for production.
+- `takgw devcerts`: writes a throwaway certificate authority, a server certificate and two client certificates for
+  trying mutual TLS locally. Not for production.
+- `cot-gen`: a synthetic, labeled search-and-rescue scenario as CoT, for test data (below).
+- `hostile-sender`: fires a catalogue of hostile and broken CoT at a gateway you run, to show it refusing each.
 
 ## Running the gateway offline
 
@@ -83,6 +89,53 @@ openssl pkcs12 -in truststore.p12 -nokeys -out tak-ca.pem             # the serv
 ```
 
 `.gitignore` excludes `devcerts/`, `*.key`, `*.p12` and `*.pfx`, so none of these end up in a commit.
+
+## Feed integrity, and the gateway on the picture
+
+A gateway is a trust boundary: whatever it accepts, the operating picture shows. Besides parsing strictly and
+checking every entity with preflight, serve drops two kinds of report that parse fine but shouldn't be believed:
+
+- **Impossible jumps.** A report whose position implies a speed nothing in its environment can reach, judged by the
+  source's own timestamps less both reports' position uncertainty: a GPS glitch, a replayed track, a spoofed
+  position. The limits are generous (about Mach 3.2 in the air, 500 km/h on land, 97 knots on the water, 49 knots
+  below it, none in space), so only the physically impossible trips them.
+- **Impersonation.** Each track is bound to the identity it is published from: the client certificate under mutual
+  TLS, or the remote IP on plain TCP. While that identity keeps reporting, another one sending the same uid is
+  dropped. The binding lapses after 90 seconds of silence, so a device that reconnects gets its track back and nobody
+  can squat a uid.
+
+Both are logged as warnings, and both show on the gateway's own asset. With `-health-position lat,lon[,hae]`, serve
+publishes itself every 30 seconds as a friendly ground asset whose health rolls up three components: input (failing
+while the TAK server connection is down), feed integrity (a warning while impossible jumps, impersonation, or a
+spike of unparsable or rejected messages arrive), and publishing (failing while publishes fail). On a clean stop it
+publishes itself once more as offline; if the gateway dies, the asset expires within 90 seconds. Its ID comes from a
+namespace of its own, so no CoT uid can overwrite it.
+
+`hostile-sender` fires 19 hostile cases at a gateway you run, each with the outcome the gateway must give; the same
+catalogue is a test suite. Over mutual TLS, with the second identity `devcerts` writes for the impersonation case:
+
+```bash
+go run ./cmd/takgw devcerts -dir devcerts
+go run ./cmd/takgw serve -source demo -simulated -listen 127.0.0.1:8089 -health-position 40.3428,-105.6836 \
+  -tls-cert devcerts/server.pem -tls-key devcerts/server.key -tls-ca devcerts/ca.pem
+go run ./cmd/hostile-sender -tcp 127.0.0.1:8089 -tls-ca devcerts/ca.pem \
+  -tls-cert devcerts/client.pem -tls-key devcerts/client.key \
+  -intruder-cert devcerts/intruder.pem -intruder-key devcerts/intruder.key
+```
+
+From one such run, with `cot-gen` streaming a normal feed alongside:
+
+```text
+level=WARN msg="dropped a suspect report" name=HOSTILE-TEST reason=implausible err="... the report implies a speed nothing in its environment can reach ..."
+level=WARN msg="dropped a suspect report" name=HOSTILE-TEST reason=origin-conflict err="... the entity is being published from another origin ..."
+level=WARN msg="connection closed on error" err="transport: malformed CoT stream: XML syntax error on line 1: invalid character entity &lol9;"
+level=WARN msg="connection closed on error" err="transport: CoT message exceeds the size limit: limit 65536 bytes"
+takgw serve: 91 messages: 62 published, 17 dropped (repeated 1, out-of-order 1, unchanged 13, implausible 1, origin-conflict 1), 10 unparsable, 2 unmappable, 0 rejected by preflight, 0 publish errors, 2 stream errors; 10 entities tracked
+```
+
+The gateway's asset went from healthy to a warning ("in the last 5s: 1 implausible jump, 1 report from another
+origin for a live track, 3 unparsable messages"), back to healthy, and to offline at the stop. `hostile-sender -list`
+describes every case.
 
 ## Publishing to Lattice, and readback
 
@@ -147,6 +200,8 @@ Passing preflight is necessary, not sufficient: the documentation can lag the se
   will.
 - **Bounded by design.** Frame size, XML depth and element count, queued messages, concurrent connections, idle
   connections and tracked entities all have limits, so a hostile or broken feed can't exhaust memory.
+- **Hostile input is a test suite.** Every case `hostile-sender` sends has the exact outcome the gateway must give,
+  and a test runs each through the real framer and pipeline.
 - **A narrow SDK boundary.** The official Lattice Go SDK is imported only by Entity Preflight, which asks it for enum
   values and field names, and by the publish adapter. A depguard lint rule enforces this. No SDK code, generated stubs
   or `.proto` files are committed to this repository.

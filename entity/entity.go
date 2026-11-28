@@ -70,6 +70,80 @@ type Entity struct {
 	Indicators          *Indicators          `json:"indicators,omitempty"`
 	Tracked             *Tracked             `json:"tracked,omitempty"`
 	DataClassification  *Classification      `json:"dataClassification,omitempty"`
+	Health              *Health              `json:"health,omitempty"`  // set on the gateway's own asset
+	Sensors             *Sensors             `json:"sensors,omitempty"` // set on the gateway's own asset
+}
+
+// HealthStatus is a health level, for an asset as a whole, one of its components, or a component message.
+type HealthStatus string
+
+// The health levels the gateway reports about itself.
+const (
+	HealthHealthy HealthStatus = "HEALTH_STATUS_HEALTHY"
+	HealthWarn    HealthStatus = "HEALTH_STATUS_WARN"
+	HealthFail    HealthStatus = "HEALTH_STATUS_FAIL"
+	HealthOffline HealthStatus = "HEALTH_STATUS_OFFLINE"
+)
+
+// ConnectionStatus says whether an asset can currently reach the platform.
+type ConnectionStatus string
+
+// The connection statuses: online while the gateway runs, offline in its last publish before a clean stop.
+const (
+	ConnectionOnline  ConnectionStatus = "CONNECTION_STATUS_ONLINE"
+	ConnectionOffline ConnectionStatus = "CONNECTION_STATUS_OFFLINE"
+)
+
+// Health is an asset's health: a roll-up status, its connection, and the components behind the roll-up.
+type Health struct {
+	HealthStatus     *HealthStatus     `json:"healthStatus,omitempty"`
+	ConnectionStatus *ConnectionStatus `json:"connectionStatus,omitempty"`
+	Components       []ComponentHealth `json:"components,omitempty"`
+	UpdateTime       *time.Time        `json:"updateTime,omitempty"`
+}
+
+// ComponentHealth is the health of one part of an asset, with messages an operator can read.
+type ComponentHealth struct {
+	ID       *string            `json:"id,omitempty"`
+	Name     *string            `json:"name,omitempty"`
+	Health   *HealthStatus      `json:"health,omitempty"`
+	Messages []ComponentMessage `json:"messages,omitempty"`
+}
+
+// ComponentMessage is one human-readable line about a component, with its own level.
+type ComponentMessage struct {
+	Status  *HealthStatus `json:"status,omitempty"`
+	Message *string       `json:"message,omitempty"`
+}
+
+// SensorType is a kind of sensor.
+type SensorType string
+
+// SensorTypeTransponder is the closest of the SDK's sensor types to a gateway's input. A TAK feed carries cooperative
+// self-reports, as transponders do; the enum has no type for a data feed.
+const SensorTypeTransponder SensorType = "SENSOR_TYPE_TRANSPONDER"
+
+// OperationalState says whether a sensor is working.
+type OperationalState string
+
+// The operational states the gateway reports for its input.
+const (
+	StateOperational    OperationalState = "OPERATIONAL_STATE_OPERATIONAL"
+	StateDegraded       OperationalState = "OPERATIONAL_STATE_DEGRADED"
+	StateNonOperational OperationalState = "OPERATIONAL_STATE_NON_OPERATIONAL"
+)
+
+// Sensors lists an asset's sensing capabilities.
+type Sensors struct {
+	Sensors []Sensor `json:"sensors,omitempty"`
+}
+
+// Sensor is one sensing capability.
+type Sensor struct {
+	SensorID          *string           `json:"sensorId,omitempty"`
+	OperationalState  *OperationalState `json:"operationalState,omitempty"`
+	SensorType        *SensorType       `json:"sensorType,omitempty"`
+	SensorDescription *string           `json:"sensorDescription,omitempty"`
 }
 
 // Classification is the entity's data classification. Only the default for the whole entity is modeled.

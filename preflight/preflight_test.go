@@ -46,6 +46,23 @@ func goodTrack() entity.Entity {
 	}
 }
 
+// asAsset turns the good track into a complete asset: the template, a health roll-up with one component, and one
+// sensor. An asset has no track quality, so that goes too.
+func asAsset(e *entity.Entity) {
+	e.Ontology.Template = new(entity.TemplateAsset)
+	e.Tracked = nil
+	e.Health = &entity.Health{
+		HealthStatus: new(entity.HealthHealthy), ConnectionStatus: new(entity.ConnectionOnline),
+		Components: []entity.ComponentHealth{{
+			ID: new("input"), Name: new("Input"), Health: new(entity.HealthHealthy),
+			Messages: []entity.ComponentMessage{{Status: new(entity.HealthHealthy), Message: new("reading")}},
+		}},
+	}
+	e.Sensors = &entity.Sensors{Sensors: []entity.Sensor{{
+		SensorID: new("cot-feed"), SensorType: new(entity.SensorTypeTransponder), OperationalState: new(entity.StateOperational),
+	}}}
+}
+
 // hit is one expected violation: which rule, on which field.
 type hit struct{ rule, field string }
 
@@ -150,11 +167,36 @@ func TestRules(t *testing.T) {
 			{"enum-values", "dataClassification.default.level"}, {"classification-set", "dataClassification.default.level"},
 		}},
 		{"geo template", func(e *entity.Entity) { e.Ontology.Template = new(entity.TemplateGeo) }, []hit{{"unchecked-template-rules", "ontology.template"}}},
-		{"asset template", func(e *entity.Entity) { e.Ontology.Template = new(entity.TemplateAsset) }, []hit{{"unchecked-template-rules", "ontology.template"}}},
+		{"asset without health or sensors", func(e *entity.Entity) { e.Ontology.Template = new(entity.TemplateAsset) }, []hit{
+			{"asset-health-set", "health.healthStatus"}, {"asset-health-set", "health.connectionStatus"}, {"asset-sensors-set", "sensors.sensors"},
+		}},
+		{"a complete asset", func(e *entity.Entity) { asAsset(e) }, nil},
 		{"asset template still needs track fields", func(e *entity.Entity) {
-			e.Ontology.Template = new(entity.TemplateAsset)
+			asAsset(e)
 			e.Ontology.PlatformType = nil
-		}, []hit{{"template-fields", "ontology.platformType"}, {"unchecked-template-rules", "ontology.template"}}},
+		}, []hit{{"template-fields", "ontology.platformType"}}},
+		{"asset with a sensor but no type", func(e *entity.Entity) {
+			asAsset(e)
+			e.Sensors.Sensors[0].SensorType = nil
+		}, []hit{{"asset-sensors-set", "sensors.sensors"}}},
+		{"bare sensor type literal", func(e *entity.Entity) {
+			asAsset(e)
+			e.Sensors.Sensors[0].SensorType = new(entity.SensorType("RADAR")) // the guide's own example of the trap
+		}, []hit{{"enum-values", "sensors.sensors[0].sensorType"}}},
+		{"bare health literals", func(e *entity.Entity) {
+			asAsset(e)
+			e.Health.HealthStatus = new(entity.HealthStatus("HEALTHY"))
+			e.Health.Components[0].Messages[0].Status = new(entity.HealthStatus("OK"))
+			e.Sensors.Sensors[0].OperationalState = new(entity.OperationalState("OPERATIONAL"))
+		}, []hit{
+			{"enum-values", "health.healthStatus"}, {"enum-values", "health.components[0].messages[0].status"},
+			{"enum-values", "sensors.sensors[0].operationalState"},
+		}},
+		{"health sentinels", func(e *entity.Entity) {
+			asAsset(e)
+			e.Health.ConnectionStatus = new(entity.ConnectionStatus("CONNECTION_STATUS_INVALID"))
+			e.Health.Components[0].Health = new(entity.HealthStatus("HEALTH_STATUS_INVALID"))
+		}, []hit{{"enum-values", "health.connectionStatus"}, {"enum-values", "health.components[0].health"}}},
 	}
 	covered := map[string]bool{}
 	for _, tt := range tests {

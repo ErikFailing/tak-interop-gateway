@@ -27,21 +27,23 @@ Keeping the core free of network and SDK code means:
 | Package | Responsibility |
 |---|---|
 | `cmd/takgw` | The binary and its subcommands. `serve` reads CoT from stdin, a listener (plain TCP or mutual TLS, with a connection limit, a 10-second handshake limit, an idle timeout and a bounded queue in front of the pipeline) or a TAK server it connects to over mutual TLS, reconnecting with backoff; it publishes as JSON lines or to Lattice. `preflight` checks entity JSON lines. `readback` round-trips test entities. `devcerts` writes development certificates. |
-| `cmd/cot-gen` | Writes a synthetic, labeled search-and-rescue scenario as CoT, to stdout or a TCP listener |
+| `cmd/cot-gen` | Writes a synthetic, labeled search-and-rescue scenario as CoT, to stdout or a TCP listener, plain or mutual TLS |
+| `cmd/hostile-sender` | Fires the `internal/hostile` catalogue at a gateway you run: to stdout as one stream, or one TCP connection per case, with a second client identity for the impersonation case |
 | `internal/cotgen` | The deterministic scenario behind `cot-gen` |
 | `preflight` | Entity Preflight: the documented acceptance rules for a candidate entity, each with an ID, a severity and pinned links to the public documentation it encodes. See [rules.md](rules.md) and the section below. Public, so other Go projects can import it. |
 | `readback` | Publishes entities, reads each back in a separate request, and diffs them field by field: dropped and changed fields fail, added ones (such as a server-filled `createdTime`) are reported. Timestamps naming the same instant, and numbers with the same value, count as equal however they're written. SDK-free: it talks through a two-method `Client` interface. Public. |
 | `internal/transport` | `Framer`: splits a TCP stream into one size-limited message per event, using the parser's own tokenizer. `ServerTLS` and `ClientTLS`: mutual-TLS configs for accepting TAK clients and for connecting to a TAK server, TLS 1.2 or later, trusting only the authority given (not the system roots, since TAK servers run their own), with no way to skip verification. |
-| `internal/devcert` | Writes a throwaway authority, server and client certificate (P-256, 30 days, keys mode 0600, never overwriting) for `takgw devcerts` and for tests. Not for production. |
+| `internal/devcert` | Writes a throwaway authority, a server certificate and two client certificates, the second an "intruder" for impersonation tests (P-256, 30 days, keys mode 0600, never overwriting), for `takgw devcerts` and for tests. Not for production. |
+| `internal/hostile` | A catalogue of 19 hostile and broken inputs, each with the exact outcome the gateway must give: replays, rewinds, teleports, impersonation, a 2099 stale time, NaN and out-of-range coordinates, duplicate attributes and elements, deep nesting, a DTD, an undefined entity, a control character, a foreign namespace, impossible times, unknown affiliations, stray text and an oversized message. Its test runs every case through the real framer and pipeline. |
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
 | `entity` | An SDK-free model of the Lattice entity fields this project sets, with the REST API's JSON field names. Public, so Entity Preflight and other Go projects can use it. |
 | `internal/mapping` | CoT event to candidate entity. See the mapping table below. |
 | `internal/pipeline` | One message's whole path: parse, map, state, Entity Preflight as a gate, publish. Reads the clock once per message, so every stage agrees on "now", and wraps every refusal with its stage (`ErrParse`, `ErrMap`, `ErrDropped`, `ErrRejected`, `ErrPublish`) as well as the stage's own reason. `takgw serve` runs one pipeline per feed. |
-| `internal/state` | The `Tracker`: drops a report that repeats or predates the last published one, and holds back one that changes nothing until a refresh is due. Memory is bounded. See the section below. |
+| `internal/state` | The `Tracker`: drops a report that repeats or predates the last published one, implies an impossible speed, or comes from another origin than a live track's; holds back one that changes nothing until a refresh is due. Memory is bounded. See the section below. |
 | `internal/publish` | The `Publisher` interface, with `Memory` (the in-process fake for tests) and `JSONL` (offline output, in the format `takgw preflight` reads). |
 | `internal/publish/latticesdk` | The SDK adapter: publishes (`PUT /api/v1/entities`) and reads back (`GET /api/v1/entities/{id}`) through the official Go SDK. Credentials come from `LATTICE_ENDPOINT`, `ENVIRONMENT_TOKEN` and `SANDBOXES_TOKEN`; the config redacts them when printed, and errors never carry them. Plain http is refused except to loopback. Errors are classified as rejected (400), unauthorized (401) or not found (404), so callers can tell a bad entity from bad credentials. |
 | `internal/latticefake` | An in-process stand-in for those two endpoints. It enforces both credentials, requires an `entityId`, stores what it's given and adds `createdTime`, the one server behavior the SDK documents. It does not validate entities: that's preflight's job, and only a live readback shows what the platform really does. |
-| `internal/health` | Publishes the gateway itself as an asset with a health component |
+| `internal/health` | Builds the gateway's own asset each interval: three health components (input, feed integrity, publishing) rolled up, one sensor standing for the feed, and an offline form for a clean stop. See the section below. |
 
 ## Mapping
 
@@ -151,6 +153,14 @@ from the code, and a test fails if the committed copy is stale.
   model's field for field: preflight checks the model's JSON, so this makes its verdict hold for the bytes actually
   sent. Others pin the request (method, path, both credential headers), the error classes, the base-URL rules, and
   that neither a printed config nor an error message ever contains a token.
+- The hostile catalogue is a test: every case runs through the real framer and pipeline on its own stream and must get
+  exactly its stated outcome. `serve` is also tested end to end with it: fed on stdin, it must turn the gateway's
+  asset to a warning and then to offline at the stop, and over mutual TLS a second client certificate claiming a live
+  track must be dropped. The teleport check is part of `FuzzPipeline`'s reference model, so every fuzzed report is
+  published or dropped exactly as the speed limits say.
+- The health monitor is tested for every roll-up (quiet, busy, a jump, a conflict, a spike, a lone bad message,
+  failing publishes, input down), for counting only each window's change, and for every form of the asset passing
+  preflight with no finding, as a value and as JSON.
 - `takgw readback` is tested offline, and in live mode against fakes that store faithfully, drop a field, and refuse
   the credentials.
 - Mutual TLS is tested as a handshake matrix over loopback, with two unrelated development authorities: a trusted
@@ -197,5 +207,30 @@ sits between the mapper and preflight and decides, per entity, whether a report 
   `-max-entities` (100,000 by default). A full Tracker scans for expired entities at most once a second, so a flood
   of new uids costs one scan a second, not one per message.
 
+- **Impossible jumps.** A report whose move since the last publish implies a speed over its environment's limit is
+  dropped. The speed is the great-circle distance, less both reports' uncertainty radius, over the time between their
+  source timestamps, taken as at least a second. The limits (`state.DefaultMaxSpeed`) are generous bounds: 1,100 m/s
+  in the air and for an unknown environment, 140 m/s on land, 50 m/s on the surface, 25 m/s below it, none in space.
+  Because the clock is the source's, a device switched off and moved is fine: the time between its reports grows
+  with the distance.
+- **Origin binding.** Each entity is bound to the origin it was published from: the client certificate's name under
+  mutual TLS, the remote IP on plain TCP (without the port, so a reconnect keeps it), `stdin`, or the TAK server's
+  address for `-connect`, where every report shares one connection and so one origin. While that origin has
+  published the entity within the last 90 seconds (three refreshes, so a stationary unit keeps it), another origin's
+  report is dropped. A binding that only lasts while its owner keeps sending can't be squatted.
+
 Two things the state stage doesn't do yet: notice the same CoT uid arriving from two different feeds, and tell a TAK
 client that restarted (its clock may jump backward) from a late arrival.
+
+## The gateway's own asset
+
+With `-health-position`, serve publishes itself every `-health-interval` (30 seconds at most, as Anduril's asset
+guide asks) as a `TEMPLATE_ASSET`: friendly, on land, at the given position. Its health rolls up three components,
+each judged over the last interval: input (failing while the TAK server connection is down), feed integrity (a
+warning on any impossible jump, origin conflict or refused new entity, or when unparsable and rejected messages are
+at least 5 and at least a tenth of the interval's messages), and publishing (failing while publishes fail). Its one
+sensor stands for the feed, as `SENSOR_TYPE_TRANSPONDER`, the closest type the SDK has to cooperative position
+reports, and is operational, degraded or non-operational to match. It expires three intervals out, so a gateway that
+dies drops off the picture on its own; a clean stop publishes it once more as offline, as the guide asks. Its ID is
+a UUIDv5 under a namespace of its own, so no CoT uid can produce it. It goes through preflight like every entity,
+and preflight's asset rules (`asset-health-set`, `asset-sensors-set`) and enum checks now cover health and sensors.

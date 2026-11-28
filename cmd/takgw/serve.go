@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/erikfailing/tak-interop-gateway/entity"
 	"github.com/erikfailing/tak-interop-gateway/internal/cot"
+	"github.com/erikfailing/tak-interop-gateway/internal/health"
 	"github.com/erikfailing/tak-interop-gateway/internal/mapping"
 	"github.com/erikfailing/tak-interop-gateway/internal/pipeline"
 	"github.com/erikfailing/tak-interop-gateway/internal/publish"
@@ -66,7 +69,8 @@ type serveConfig struct {
 	stdin       bool
 	listen      string
 	connect     string
-	tls         *tls.Config // the listener's or the dialer's TLS; nil for plain TCP
+	tls         *tls.Config    // the listener's or the dialer's TLS; nil for plain TCP
+	health      *health.Config // the gateway's own asset; nil when -health-position isn't given
 	out         string
 	lattice     bool
 	maxConns    int
@@ -118,7 +122,7 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	}
 
 	// 2: Start the readers. Each sends framed messages to one queue, which only the pipeline goroutine reads.
-	frames := make(chan []byte, frameQueue)
+	frames := make(chan frame, frameQueue)
 	s := &server{log: log, frames: frames, maxConns: cfg.maxConns, idleTimeout: cfg.idleTimeout}
 	readCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
@@ -128,7 +132,7 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	case cfg.stdin:
 		go func() {
 			defer readers.Done()
-			if err := s.readStream(readCtx, stdin, "stdin"); err != nil {
+			if err := s.readStream(readCtx, stdin, "stdin", "stdin"); err != nil {
 				log.Error("stdin stream", "err", err)
 				s.streamFailed()
 			}
@@ -165,24 +169,62 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	// 3: Process messages in arrival order until the readers are done or the context ends, or a fatal publish failure.
 	c := counters{dropped: map[string]int{}}
 	code = 0
-	process := func(ctx context.Context, msg []byte) bool {
+	publishFailed := func(id string, err error) bool {
+		if fatal(err) {
+			log.Error("publish failed, stopping", "err", err)
+			code = 1
+			return false
+		}
+		log.Warn("publish failed", "entity", id, "err", err)
+		return true
+	}
+	process := func(ctx context.Context, f frame) bool {
 		c.messages++
-		res, err := p.Process(ctx, msg)
+		res, err := p.Process(ctx, f.data, f.origin)
 		if count(&c, log, res, err) {
-			if fatal(err) {
-				log.Error("publish failed, stopping", "err", err)
-				code = 1
-				return false
-			}
-			log.Warn("publish failed", "entity", idOf(res.Entity), "err", err)
+			return publishFailed(idOf(res.Entity), err)
 		}
 		return true
+	}
+
+	// The gateway's own asset goes out at once, then every interval, and once more, as offline, after a clean stop. It
+	// is checked by preflight like any entity, and goes through the same publisher.
+	self := func(ctx context.Context, e entity.Entity) bool {
+		if vs := preflight.NewChecker(time.Now).Check(e); preflight.HasErrors(vs) {
+			log.Error("the gateway's own asset fails preflight; not publishing it", "findings", fmt.Sprint(vs))
+			return true
+		}
+		if err := cfg.pipeline.Publisher.Publish(ctx, e); err != nil {
+			c.publishErr++
+			return publishFailed(idOf(e), err)
+		}
+		return true
+	}
+	var monitor *health.Monitor
+	var tick <-chan time.Time
+	if cfg.health != nil {
+		var err error
+		if monitor, err = health.New(*cfg.health); err != nil {
+			fmt.Fprintf(stderr, "takgw serve: %v\n", err)
+			return 2
+		}
+		ticker := time.NewTicker(cfg.health.Interval)
+		defer ticker.Stop()
+		tick = ticker.C
+		log.Info("publishing the gateway's own asset", "entity", monitor.ID(), "every", cfg.health.Interval)
+		if !self(ctx, monitor.Snapshot(time.Now(), c.totals(), s.input(cfg))) {
+			return code
+		}
 	}
 loop:
 	for {
 		select {
-		case msg, ok := <-frames:
-			if !ok || !process(ctx, msg) {
+		case f, ok := <-frames:
+			if !ok || !process(ctx, f) {
+				break loop
+			}
+		case <-tick:
+			if !self(ctx, monitor.Snapshot(time.Now(), c.totals(), s.input(cfg))) {
 				break loop
 			}
 		case <-ctx.Done():
@@ -191,8 +233,8 @@ loop:
 			drain := context.WithoutCancel(ctx)
 			for {
 				select {
-				case msg, ok := <-frames:
-					if !ok || !process(drain, msg) {
+				case f, ok := <-frames:
+					if !ok || !process(drain, f) {
 						break loop
 					}
 				default:
@@ -210,7 +252,12 @@ loop:
 		readers.Wait()
 	}
 
-	// 5: Summarize. A malformed stdin stream is a failure; a bad TCP connection is only that connection's problem.
+	// 5: Say goodbye on the operating picture, unless publishing is what failed.
+	if monitor != nil && code == 0 && self(context.WithoutCancel(ctx), monitor.Offline(time.Now())) {
+		log.Info("published the gateway's own asset as offline", "entity", monitor.ID())
+	}
+
+	// 6: Summarize. A malformed stdin stream is a failure; a bad TCP connection is only that connection's problem.
 	c.streamErr = s.streamErrors()
 	if cfg.stdin && c.streamErr > 0 && code == 0 {
 		code = 1
@@ -224,13 +271,23 @@ loop:
 // dropReasons names each state-stage reason in logs and the summary.
 var dropReasons = map[error]string{
 	state.ErrRepeated: "repeated", state.ErrOutOfOrder: "out-of-order", state.ErrUnchanged: "unchanged", state.ErrFull: "full",
+	state.ErrImplausible: "implausible", state.ErrOriginConflict: "origin-conflict",
+}
+
+// totals turns the counters into what the health monitor reads.
+func (c *counters) totals() health.Totals {
+	return health.Totals{
+		Messages: c.messages, Published: c.published, Unparsable: c.parse, Rejected: c.rejected,
+		PublishErrors: c.publishErr, Implausible: c.dropped["implausible"], OriginConflicts: c.dropped["origin-conflict"],
+		Full: c.dropped["full"],
+	}
 }
 
 // drops formats the drop counts as "3 dropped (repeated 1, unchanged 2)", in a fixed order.
 func drops(m map[string]int) string {
 	n := 0
 	var parts []string
-	for _, reason := range []string{"repeated", "out-of-order", "unchanged", "full"} {
+	for _, reason := range []string{"repeated", "out-of-order", "unchanged", "full", "implausible", "origin-conflict"} {
 		if m[reason] > 0 {
 			n += m[reason]
 			parts = append(parts, fmt.Sprintf("%s %d", reason, m[reason]))
@@ -261,9 +318,13 @@ func count(c *counters, log *slog.Logger, res pipeline.Result, err error) bool {
 			}
 		}
 		c.dropped[reason]++
-		if reason == "full" {
+		switch reason {
+		case "full":
 			log.Warn("dropped a new entity: the state stage is full", "entity", id)
-		} else {
+		case "implausible", "origin-conflict":
+			// Feed integrity: these are the drops an operator should see, whatever the log level.
+			log.Warn("dropped a suspect report", "entity", id, "name", name(res.Entity), "reason", reason, "err", err)
+		default:
 			log.Debug("dropped", "entity", id, "reason", reason)
 		}
 	case errors.Is(err, pipeline.ErrParse):
@@ -320,6 +381,9 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 	maxEntities := fs.Int("max-entities", state.DefaultMaxEntities, "how many entities to track at once")
 	maxConns := fs.Int("max-conns", 16, "with -listen, how many connections at once")
 	idle := fs.Duration("idle-timeout", 5*time.Minute, "with -listen, close a connection silent for this long")
+	healthPosition := fs.String("health-position", "", "publish the gateway itself as an asset at lat,lon[,hae]: where it runs")
+	healthName := fs.String("health-name", "", `the gateway asset's display name (default "takgw (SOURCE)")`)
+	healthInterval := fs.Duration("health-interval", health.MaxInterval, "how often to republish the gateway asset, at most 30s")
 	verbose := fs.Bool("v", false, "log every message's outcome")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, serveUsage)
@@ -392,6 +456,24 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 		maxConns: *maxConns, idleTimeout: *idle, verbose: *verbose,
 	}
 
+	// The gateway's own asset, when asked for.
+	switch {
+	case *healthPosition != "":
+		lat, lon, hae, err := parsePosition(*healthPosition)
+		if err != nil {
+			return usage("-health-position: %v", err)
+		}
+		cfg.health = &health.Config{
+			Source: *source, Name: *healthName, Latitude: lat, Longitude: lon, Altitude: hae, Interval: *healthInterval,
+			IntegrationName: *integration, Simulated: *simulated, Classification: level, Input: inputName(cfg),
+		}
+		if _, err := health.New(*cfg.health); err != nil {
+			return usage("%v", err)
+		}
+	case *healthName != "" || flagSet(fs, "health-interval"):
+		return usage("-health-name and -health-interval need -health-position")
+	}
+
 	// The pipeline checks these again, but checking now keeps a usage error from creating the -out file first.
 	if err := cfg.pipeline.Mapping.Validate(); err != nil {
 		return usage("%v", err)
@@ -400,6 +482,40 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 		return usage("%v", err)
 	}
 	return cfg, -1
+}
+
+// parsePosition reads "lat,lon" or "lat,lon,hae" in degrees and meters. health.New checks the ranges.
+func parsePosition(s string) (lat, lon float64, hae *float64, err error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, 0, nil, fmt.Errorf("want lat,lon or lat,lon,hae, got %q", s)
+	}
+	var v [3]float64
+	for i, p := range parts {
+		if v[i], err = strconv.ParseFloat(strings.TrimSpace(p), 64); err != nil {
+			return 0, 0, nil, fmt.Errorf("%q is not a number", p)
+		}
+	}
+	if len(parts) == 3 {
+		if math.IsNaN(v[2]) || math.IsInf(v[2], 0) {
+			return 0, 0, nil, fmt.Errorf("altitude %q is not a finite number", parts[2])
+		}
+		hae = new(v[2])
+	}
+	return v[0], v[1], hae, nil
+}
+
+// inputName describes the feed, for the gateway asset's sensor.
+func inputName(cfg serveConfig) string {
+	switch {
+	case cfg.connect != "":
+		return "TAK server " + cfg.connect
+	case cfg.listen != "" && cfg.tls != nil:
+		return "TAK clients on " + cfg.listen + " (mutual TLS)"
+	case cfg.listen != "":
+		return "TAK clients on " + cfg.listen
+	}
+	return "stdin"
 }
 
 // howMany counts the true values.
@@ -424,15 +540,55 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 	return set
 }
 
+// frame is one framed CoT message and where it came from.
+type frame struct {
+	data []byte
+	// origin identifies the sender, for the state stage's origin binding: the client certificate's name under mutual
+	// TLS, the remote address's IP on plain TCP, "stdin", or the TAK server's address for -connect, where every
+	// report arrives on the server's one connection.
+	origin string
+}
+
 // server holds what the readers share.
 type server struct {
 	log         *slog.Logger
-	frames      chan<- []byte
+	frames      chan<- frame
 	maxConns    int
 	idleTimeout time.Duration
 
 	mu        sync.Mutex
 	streamErr int
+	conns     int  // open connections, with -listen
+	connected bool // whether the TAK server connection is up, with -connect
+}
+
+// adjustConns changes the count of open connections.
+func (s *server) adjustConns(delta int) {
+	s.mu.Lock()
+	s.conns += delta
+	s.mu.Unlock()
+}
+
+// setConnected records whether the TAK server connection is up.
+func (s *server) setConnected(up bool) {
+	s.mu.Lock()
+	s.connected = up
+	s.mu.Unlock()
+}
+
+// input reports the feed's state for the health asset.
+func (s *server) input(cfg serveConfig) health.Input {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case cfg.connect != "" && s.connected:
+		return health.Input{Up: true, Detail: "connected to " + cfg.connect}
+	case cfg.connect != "":
+		return health.Input{Up: false, Detail: "not connected to " + cfg.connect + "; reconnecting"}
+	case cfg.listen != "":
+		return health.Input{Up: true, Detail: fmt.Sprintf("listening on %s, %d connections open", cfg.listen, s.conns)}
+	}
+	return health.Input{Up: true, Detail: "reading stdin"}
 }
 
 // streamFailed counts a stream that ended with an error.
@@ -451,7 +607,7 @@ func (s *server) streamErrors() int {
 
 // readStream frames one stream and queues each message, until the stream ends or ctx is done. It returns nil at a
 // clean end of the stream, and the framer's error otherwise.
-func (s *server) readStream(ctx context.Context, r io.Reader, name string) error {
+func (s *server) readStream(ctx context.Context, r io.Reader, name, origin string) error {
 	fr := transport.NewFramer(r, cot.DefaultLimits.MaxBytes)
 	for {
 		msg, err := fr.Next()
@@ -463,7 +619,7 @@ func (s *server) readStream(ctx context.Context, r io.Reader, name string) error
 			return err
 		}
 		select {
-		case s.frames <- msg:
+		case s.frames <- frame{data: msg, origin: origin}:
 		case <-ctx.Done():
 			return nil
 		}
@@ -518,7 +674,10 @@ func (s *server) acceptLoop(ctx context.Context, ln net.Listener) {
 // finish its handshake, client certificate and all, within handshakeTimeout, so a client that stalls mid-handshake
 // can't hold one of the -max-conns slots for the whole idle timeout.
 func (s *server) serveConn(ctx context.Context, conn net.Conn) {
+	// 1: Complete a TLS handshake, and work out the connection's origin: its certificate's name under mutual TLS, or
+	// else its IP address, without the port, so a client that reconnects keeps its origin.
 	remote := conn.RemoteAddr().String()
+	origin, _, _ := net.SplitHostPort(remote)
 	attrs := []any{"remote", remote}
 	if tc, ok := conn.(*tls.Conn); ok {
 		hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
@@ -531,10 +690,15 @@ func (s *server) serveConn(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
+		origin = "cert:" + transport.PeerName(tc.ConnectionState())
 		attrs = append(attrs, "client", transport.PeerName(tc.ConnectionState()))
 	}
+
+	// 2: Read until the connection ends.
+	s.adjustConns(1)
+	defer s.adjustConns(-1)
 	s.log.Info("connection opened", attrs...)
-	err := s.readStream(ctx, &idleReader{conn: conn, timeout: s.idleTimeout}, remote)
+	err := s.readStream(ctx, &idleReader{conn: conn, timeout: s.idleTimeout}, remote, origin)
 	if err != nil && ctx.Err() == nil {
 		s.log.Warn("connection closed on error", "remote", remote, "err", err)
 		s.streamFailed()
@@ -598,7 +762,9 @@ func (s *server) connectOnce(ctx context.Context, addr string, cfg *tls.Config) 
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() }) // a stop unblocks the read
 	defer stop()
 	s.log.Info("connected", "addr", addr, "server", transport.PeerName(conn.(*tls.Conn).ConnectionState()))
-	return s.readStream(ctx, &idleReader{conn: conn, timeout: s.idleTimeout}, addr)
+	s.setConnected(true)
+	defer s.setConnected(false)
+	return s.readStream(ctx, &idleReader{conn: conn, timeout: s.idleTimeout}, addr, addr)
 }
 
 // jitter spreads d by up to 20% either way, so gateways that lost the same server don't all reconnect in step.
