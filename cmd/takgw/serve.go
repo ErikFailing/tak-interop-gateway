@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strings"
@@ -25,15 +27,21 @@ import (
 )
 
 // serveUsage heads the flag list for `takgw serve -h`.
-const serveUsage = `usage: takgw serve -source NAME (-stdin | -listen HOST:PORT) [flags]
+const serveUsage = `usage: takgw serve -source NAME (-stdin | -listen HOST:PORT | -connect HOST:PORT) [flags]
 
-Runs the gateway: reads a CoT stream, maps each event to a Lattice entity, drops repeats, late arrivals and unchanged
-reports, checks what's left with Entity Preflight, and publishes it. By default each entity is written as one JSON
-line to -out, the format "takgw preflight" reads. With -lattice it is published to the Lattice environment named by
+Runs the gateway: reads CoT, maps each event to a Lattice entity, drops repeats, late arrivals and unchanged reports,
+checks what's left with Entity Preflight, and publishes it. By default each entity is written as one JSON line to
+-out, the format "takgw preflight" reads. With -lattice it is published to the Lattice environment named by
 LATTICE_ENDPOINT, ENVIRONMENT_TOKEN and, for Sandboxes, SANDBOXES_TOKEN.
 
--listen accepts plain TCP with no authentication, so anyone who can reach the port can inject tracks. Bind it to a
-loopback address or a trusted network; TLS with client certificates is still to come.
+Where the CoT comes from:
+  -stdin             one stream on standard input, until it ends.
+  -listen HOST:PORT  streams from TAK clients or servers that connect in. With -tls-cert, -tls-key and -tls-ca, only
+                     clients presenting a certificate signed by -tls-ca are accepted (mutual TLS). Without them it is
+                     plain TCP with no authentication: anyone who can reach the port can inject tracks.
+  -connect HOST:PORT a TAK server's streaming TLS port (often 8089), connected to as a client with -tls-cert and
+                     -tls-key, trusting only -tls-ca for the server. Reconnects with backoff. It never writes to the
+                     server. Certificate files are PEM; convert a TAK .p12 with openssl.
 
 Exit status: 0 after a clean stop (end of stdin, or Ctrl-C), 1 for a runtime failure (a malformed stdin stream, a
 listener or output error, or credentials the platform refuses), 2 for a usage error. With -lattice, an entity the
@@ -57,6 +65,8 @@ type serveConfig struct {
 	pipeline    pipeline.Config
 	stdin       bool
 	listen      string
+	connect     string
+	tls         *tls.Config // the listener's or the dialer's TLS; nil for plain TCP
 	out         string
 	lattice     bool
 	maxConns    int
@@ -114,7 +124,8 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	defer stopReading()
 	var readers sync.WaitGroup
 	readers.Add(1)
-	if cfg.stdin {
+	switch {
+	case cfg.stdin:
 		go func() {
 			defer readers.Done()
 			if err := s.readStream(readCtx, stdin, "stdin"); err != nil {
@@ -122,14 +133,25 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 				s.streamFailed()
 			}
 		}()
-	} else {
+	case cfg.connect != "":
+		log.Info("connecting", "addr", cfg.connect)
+		go func() {
+			defer readers.Done()
+			s.connectLoop(readCtx, cfg.connect, cfg.tls)
+		}()
+	default:
 		ln, err := net.Listen("tcp", cfg.listen)
 		if err != nil {
 			fmt.Fprintf(stderr, "takgw serve: listen: %v\n", err)
 			return 1
 		}
-		warnIfExposed(log, ln.Addr())
-		log.Info("listening", "addr", ln.Addr().String())
+		if cfg.tls != nil {
+			ln = tls.NewListener(ln, cfg.tls)
+			log.Info("listening with mutual TLS", "addr", ln.Addr().String())
+		} else {
+			warnIfExposed(log, ln.Addr())
+			log.Info("listening", "addr", ln.Addr().String())
+		}
 		go func() {
 			defer readers.Done()
 			s.acceptLoop(readCtx, ln)
@@ -180,9 +202,9 @@ loop:
 		}
 	}
 
-	// 4: Stop the readers. TCP readers always finish once the listener and connections are closed, so wait for them,
-	// and their last log lines, before summarizing. A stdin reader may be blocked in a read nothing can interrupt; at
-	// a clean end of input it has already finished, and otherwise the process is about to exit anyway.
+	// 4: Stop the readers. Network readers always finish once their connections are closed, so wait for them, and
+	// their last log lines, before summarizing. A stdin reader may be blocked in a read nothing can interrupt; at a
+	// clean end of input it has already finished, and otherwise the process is about to exit anyway.
 	stopReading()
 	if !cfg.stdin {
 		readers.Wait()
@@ -282,7 +304,12 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 	fs.SetOutput(stderr)
 	source := fs.String("source", "", "name of this feed (required); it is part of every entity ID, so keep it stable")
 	useStdin := fs.Bool("stdin", false, "read one CoT stream from stdin, and stop at its end")
-	listen := fs.String("listen", "", "accept CoT streams over plain TCP on this host:port")
+	listen := fs.String("listen", "", "accept CoT streams on this host:port: mutual TLS with the -tls flags, otherwise plain TCP")
+	connect := fs.String("connect", "", "connect to a TAK server's streaming TLS port at this host:port (needs the -tls flags)")
+	tlsCert := fs.String("tls-cert", "", "this side's certificate, PEM")
+	tlsKey := fs.String("tls-key", "", "the private key for -tls-cert, PEM")
+	tlsCA := fs.String("tls-ca", "", "the authority, PEM, that the other side's certificate must be signed by")
+	tlsServerName := fs.String("tls-server-name", "", "with -connect, the name the server's certificate must carry, if not the host dialed")
 	out := fs.String("out", "-", `append published entities as JSON lines to this file; "-" is stdout`)
 	lattice := fs.Bool("lattice", false, "publish to the Lattice environment in LATTICE_ENDPOINT, ENVIRONMENT_TOKEN and SANDBOXES_TOKEN instead of -out")
 	simulated := fs.Bool("simulated", false, "mark every entity as simulated (do this for test data such as cot-gen's)")
@@ -315,14 +342,38 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 		return usage("unexpected arguments: %v", fs.Args())
 	case *source == "":
 		return usage("-source is required: it names the feed, and is part of every entity ID")
-	case *useStdin == (*listen != ""):
-		return usage("choose exactly one of -stdin or -listen")
+	case howMany(*useStdin, *listen != "", *connect != "") != 1:
+		return usage("choose exactly one of -stdin, -listen or -connect")
 	case *maxConns < 1:
 		return usage("-max-conns must be at least 1")
 	case *idle <= 0:
 		return usage("-idle-timeout must be positive")
 	case *lattice && flagSet(fs, "out"):
 		return usage("choose -lattice or -out, not both")
+	}
+
+	// TLS: all three files or none, only for a network input, and always for -connect.
+	tlsFlags := howMany(*tlsCert != "", *tlsKey != "", *tlsCA != "")
+	var tlsConfig *tls.Config
+	switch {
+	case tlsFlags != 0 && tlsFlags != 3:
+		return usage("-tls-cert, -tls-key and -tls-ca go together: give all three")
+	case tlsFlags == 3 && *useStdin:
+		return usage("the -tls flags need -listen or -connect")
+	case tlsFlags == 0 && *connect != "":
+		return usage("-connect needs -tls-cert, -tls-key and -tls-ca: TAK servers take mutual TLS")
+	case *tlsServerName != "" && *connect == "":
+		return usage("-tls-server-name needs -connect")
+	case tlsFlags == 3 && *connect != "":
+		var err error
+		if tlsConfig, err = transport.ClientTLS(*tlsCert, *tlsKey, *tlsCA, *tlsServerName); err != nil {
+			return usage("%v", err)
+		}
+	case tlsFlags == 3:
+		var err error
+		if tlsConfig, err = transport.ServerTLS(*tlsCert, *tlsKey, *tlsCA); err != nil {
+			return usage("%v", err)
+		}
 	}
 	level := entity.ClassificationLevel(*classification)
 	if err := preflight.CheckClassification(level); err != nil {
@@ -337,8 +388,8 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 			Limits: cot.DefaultLimits,
 			State:  state.Config{Refresh: *refresh, MaxEntities: *maxEntities},
 		},
-		stdin: *useStdin, listen: *listen, out: *out, lattice: *lattice, maxConns: *maxConns, idleTimeout: *idle,
-		verbose: *verbose,
+		stdin: *useStdin, listen: *listen, connect: *connect, tls: tlsConfig, out: *out, lattice: *lattice,
+		maxConns: *maxConns, idleTimeout: *idle, verbose: *verbose,
 	}
 
 	// The pipeline checks these again, but checking now keeps a usage error from creating the -out file first.
@@ -349,6 +400,17 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 		return usage("%v", err)
 	}
 	return cfg, -1
+}
+
+// howMany counts the true values.
+func howMany(bs ...bool) int {
+	n := 0
+	for _, b := range bs {
+		if b {
+			n++
+		}
+	}
+	return n
 }
 
 // flagSet reports whether the named flag was given on the command line, as opposed to left at its default.
@@ -452,10 +514,26 @@ func (s *server) acceptLoop(ctx context.Context, ln net.Listener) {
 	}
 }
 
-// serveConn reads one connection until it ends, goes idle or sends something unframeable.
+// serveConn reads one connection until it ends, goes idle or sends something unframeable. A TLS connection must
+// finish its handshake, client certificate and all, within handshakeTimeout, so a client that stalls mid-handshake
+// can't hold one of the -max-conns slots for the whole idle timeout.
 func (s *server) serveConn(ctx context.Context, conn net.Conn) {
 	remote := conn.RemoteAddr().String()
-	s.log.Info("connection opened", "remote", remote)
+	attrs := []any{"remote", remote}
+	if tc, ok := conn.(*tls.Conn); ok {
+		hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+		err := tc.HandshakeContext(hctx)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				s.log.Warn("TLS handshake failed", "remote", remote, "err", err)
+				s.streamFailed()
+			}
+			return
+		}
+		attrs = append(attrs, "client", transport.PeerName(tc.ConnectionState()))
+	}
+	s.log.Info("connection opened", attrs...)
 	err := s.readStream(ctx, &idleReader{conn: conn, timeout: s.idleTimeout}, remote)
 	if err != nil && ctx.Err() == nil {
 		s.log.Warn("connection closed on error", "remote", remote, "err", err)
@@ -463,6 +541,69 @@ func (s *server) serveConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	s.log.Info("connection closed", "remote", remote)
+}
+
+// handshakeTimeout bounds a TLS handshake, in either direction.
+const handshakeTimeout = 10 * time.Second
+
+// The reconnect backoff for -connect: it starts at minBackoff, doubles after each failed attempt up to maxBackoff, and
+// starts over after a connection that stayed up for resetBackoff. They're variables so tests can shorten them.
+var (
+	minBackoff   = time.Second
+	maxBackoff   = time.Minute
+	resetBackoff = time.Minute
+)
+
+// connectLoop keeps a connection to a TAK server open until ctx is done, reconnecting with backoff whenever it fails
+// or the server closes it. Each failed attempt counts as a stream error.
+func (s *server) connectLoop(ctx context.Context, addr string, cfg *tls.Config) {
+	delay := minBackoff
+	for {
+		// 1: Connect and read until the connection ends.
+		started := time.Now()
+		err := s.connectOnce(ctx, addr, cfg)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			s.streamFailed()
+		}
+
+		// 2: Back off before trying again, unless the connection had been healthy for a while.
+		if time.Since(started) >= resetBackoff {
+			delay = minBackoff
+		}
+		wait := jitter(delay)
+		s.log.Warn("TAK server connection ended; reconnecting", "addr", addr, "err", err, "in", wait.Round(time.Millisecond))
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
+		delay = min(2*delay, maxBackoff)
+	}
+}
+
+// connectOnce dials the server, completes the TLS handshake, and reads until the connection ends. It returns nil when
+// the server closed the connection cleanly.
+func (s *server) connectOnce(ctx context.Context, addr string, cfg *tls.Config) error {
+	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: handshakeTimeout}, Config: cfg}
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	conn, err := d.DialContext(hctx, "tcp", addr) // returns once the handshake is done
+	cancel()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() }) // a stop unblocks the read
+	defer stop()
+	s.log.Info("connected", "addr", addr, "server", transport.PeerName(conn.(*tls.Conn).ConnectionState()))
+	return s.readStream(ctx, &idleReader{conn: conn, timeout: s.idleTimeout}, addr)
+}
+
+// jitter spreads d by up to 20% either way, so gateways that lost the same server don't all reconnect in step.
+func jitter(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
 }
 
 // idleReader pushes a connection's read deadline forward before every read, so a connection that sends nothing for

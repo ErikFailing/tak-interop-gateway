@@ -26,12 +26,13 @@ Keeping the core free of network and SDK code means:
 
 | Package | Responsibility |
 |---|---|
-| `cmd/takgw` | The binary and its subcommands. `serve` reads CoT from stdin or plain TCP (with a connection limit, an idle timeout and a bounded queue in front of the pipeline) and publishes offline as JSON lines. `preflight` checks entity JSON lines. `readback` is still to come. |
+| `cmd/takgw` | The binary and its subcommands. `serve` reads CoT from stdin, a listener (plain TCP or mutual TLS, with a connection limit, a 10-second handshake limit, an idle timeout and a bounded queue in front of the pipeline) or a TAK server it connects to over mutual TLS, reconnecting with backoff; it publishes as JSON lines or to Lattice. `preflight` checks entity JSON lines. `readback` round-trips test entities. `devcerts` writes development certificates. |
 | `cmd/cot-gen` | Writes a synthetic, labeled search-and-rescue scenario as CoT, to stdout or a TCP listener |
 | `internal/cotgen` | The deterministic scenario behind `cot-gen` |
 | `preflight` | Entity Preflight: the documented acceptance rules for a candidate entity, each with an ID, a severity and pinned links to the public documentation it encodes. See [rules.md](rules.md) and the section below. Public, so other Go projects can import it. |
 | `readback` | Publishes entities, reads each back in a separate request, and diffs them field by field: dropped and changed fields fail, added ones (such as a server-filled `createdTime`) are reported. Timestamps naming the same instant, and numbers with the same value, count as equal however they're written. SDK-free: it talks through a two-method `Client` interface. Public. |
-| `internal/transport` | `Framer`: splits a TCP stream into one size-limited message per event, using the parser's own tokenizer. Connections to TAK servers and clients (TCP, TLS with client certificates) are still to come. |
+| `internal/transport` | `Framer`: splits a TCP stream into one size-limited message per event, using the parser's own tokenizer. `ServerTLS` and `ClientTLS`: mutual-TLS configs for accepting TAK clients and for connecting to a TAK server, TLS 1.2 or later, trusting only the authority given (not the system roots, since TAK servers run their own), with no way to skip verification. |
+| `internal/devcert` | Writes a throwaway authority, server and client certificate (P-256, 30 days, keys mode 0600, never overwriting) for `takgw devcerts` and for tests. Not for production. |
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
 | `entity` | An SDK-free model of the Lattice entity fields this project sets, with the REST API's JSON field names. Public, so Entity Preflight and other Go projects can use it. |
 | `internal/mapping` | CoT event to candidate entity. See the mapping table below. |
@@ -152,6 +153,14 @@ from the code, and a test fails if the committed copy is stale.
   that neither a printed config nor an error message ever contains a token.
 - `takgw readback` is tested offline, and in live mode against fakes that store faithfully, drop a field, and refuse
   the credentials.
+- Mutual TLS is tested as a handshake matrix over loopback, with two unrelated development authorities: a trusted
+  client gets in and its certificate name is seen; a client with no certificate, one from the other authority, or
+  one offering only TLS 1.1 is refused; a client refuses a server from the other authority or with the wrong name.
+  Each bad file (missing, mismatched key, a CA file with no certificates) fails when the config is built, not at the
+  first handshake. End to end, `serve -listen` with mutual TLS publishes a trusted client's reports and refuses a
+  client without a certificate and one speaking plain TCP; `serve -connect` reconnects to a stand-in TAK server that
+  closes after every tick, dropping the repeated reports; and it refuses a server signed by another authority, keeps
+  retrying, and stops cleanly.
 
 ## Publishing to Lattice
 

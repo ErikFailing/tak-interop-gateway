@@ -4,23 +4,25 @@ A gateway that translates TAK Cursor-on-Target (CoT) traffic into entities for t
 validator, Entity Preflight, that checks every entity against the platform's documented acceptance rules before it is
 sent.
 
-> **Status: early development.** The whole path works: `takgw serve` reads CoT from stdin or TCP, maps it, filters
-> it, checks it with Entity Preflight, and publishes it, as JSON lines or to Lattice through the official Go SDK, and
-> `takgw readback` checks what the platform stored. Everything is tested against an in-process fake of the Lattice
-> REST API; it has not yet been run against a live environment. TLS with client certificates on the TAK side is
-> still to come.
+> **Status: early development.** The whole path works: `takgw serve` reads CoT from stdin, from TAK clients
+> connecting in (plain TCP or mutual TLS), or from a TAK server it connects to over mutual TLS; maps it, filters it,
+> checks it with Entity Preflight, and publishes it, as JSON lines or to Lattice through the official Go SDK; and
+> `takgw readback` checks what the platform stored. The Lattice side is tested against an in-process fake of its REST
+> API, and the TAK side against local TLS stand-ins; neither has yet been run against a live system.
 
 ## Components
 
 One binary, `takgw`, with three commands:
 
-- `takgw serve`: the gateway. Reads CoT from stdin or plain TCP, maps each event to an entity, drops repeats, late
-  arrivals and unchanged reports, checks what's left with Entity Preflight, and publishes it: as JSON lines by
-  default, or to a Lattice environment with `-lattice`.
+- `takgw serve`: the gateway. Reads CoT from stdin, a listener (plain TCP or mutual TLS), or a TAK server's
+  streaming TLS port, maps each event to an entity, drops repeats, late arrivals and unchanged reports, checks what's
+  left with Entity Preflight, and publishes it: as JSON lines by default, or to a Lattice environment with `-lattice`.
 - `takgw preflight`: Entity Preflight as a standalone tool. Reads entity JSON and reports any entity that breaks a
   documented rule, so other integrations can run it in their own CI.
 - `takgw readback`: a round-trip check. Publishes the project's own simulated test entities, reads each back in a
   separate request, and reports any field the platform dropped or changed.
+- `takgw devcerts`: writes a throwaway certificate authority, server and client certificate for trying mutual TLS
+  locally. Not for production.
 
 ## Running the gateway offline
 
@@ -41,9 +43,46 @@ go run ./cmd/takgw serve -listen 127.0.0.1:8087 -source demo -simulated -out ent
 go run ./cmd/cot-gen -tcp 127.0.0.1:8087 -realtime -ticks 0                                   # in another terminal
 ```
 
-`-listen` takes plain TCP with no authentication, so anyone who can reach the port can inject tracks: bind it to a
-loopback address or a trusted network (serve warns when it isn't loopback). `-source` names the feed and is part of
-every entity ID, so keep it stable. Pass `-simulated` for test data. Run `takgw serve -h` for every flag.
+`-listen` without TLS takes plain TCP with no authentication, so anyone who can reach the port can inject tracks:
+bind it to a loopback address or a trusted network (serve warns when it isn't loopback), or use mutual TLS, below.
+`-source` names the feed and is part of every entity ID, so keep it stable. Pass `-simulated` for test data. Run
+`takgw serve -h` for every flag.
+
+## Mutual TLS, and connecting to a TAK server
+
+TAK servers authenticate clients by certificate, so the gateway speaks mutual TLS in both directions. With
+`-tls-cert`, `-tls-key` and `-tls-ca`, `-listen` accepts only clients whose certificate the given authority signed,
+and `-connect` dials a TAK server with the gateway's own certificate, trusting only the given authority for the
+server's. There is no option to skip verification. To try it locally:
+
+```bash
+go run ./cmd/takgw devcerts -dir devcerts      # a throwaway CA, server and client certificate; never overwrites
+go run ./cmd/takgw serve -source demo -simulated -listen 127.0.0.1:8089 \
+  -tls-cert devcerts/server.pem -tls-key devcerts/server.key -tls-ca devcerts/ca.pem
+go run ./cmd/cot-gen -tcp 127.0.0.1:8089 -realtime -ticks 0 \
+  -tls-cert devcerts/client.pem -tls-key devcerts/client.key -tls-ca devcerts/ca.pem
+```
+
+serve logs each client's certificate name, and refuses a client without a trusted certificate at the handshake,
+which must finish within 10 seconds. Against a TAK server's streaming port (often 8089), with a client certificate
+the server's authority issued:
+
+```bash
+go run ./cmd/takgw serve -source tak-main -connect tak.example.org:8089 \
+  -tls-cert takgw.pem -tls-key takgw.key -tls-ca tak-ca.pem
+```
+
+`-connect` reconnects with backoff (1 second doubling to a minute, with jitter) whenever the connection fails or the
+server closes it, and only ever reads. TAK's certificate tools write PKCS #12 files; the gateway reads PEM, so convert
+them with openssl (add `-legacy` if OpenSSL 3 refuses an older file):
+
+```bash
+openssl pkcs12 -in takgw.p12 -clcerts -nokeys -out takgw.pem          # the gateway's certificate
+openssl pkcs12 -in takgw.p12 -nocerts -nodes -out takgw.key           # its private key: keep it private
+openssl pkcs12 -in truststore.p12 -nokeys -out tak-ca.pem             # the server's authority
+```
+
+`.gitignore` excludes `devcerts/`, `*.key`, `*.p12` and `*.pfx`, so none of these end up in a commit.
 
 ## Publishing to Lattice, and readback
 

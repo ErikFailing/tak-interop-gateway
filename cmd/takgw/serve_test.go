@@ -74,8 +74,8 @@ func TestServeUsage(t *testing.T) {
 		wantStderr string
 	}{
 		{"no source", []string{"-stdin"}, 2, "-source is required"},
-		{"no input", []string{"-source", "s"}, 2, "exactly one of -stdin or -listen"},
-		{"two inputs", []string{"-source", "s", "-stdin", "-listen", "127.0.0.1:0"}, 2, "exactly one of -stdin or -listen"},
+		{"no input", []string{"-source", "s"}, 2, "exactly one of -stdin, -listen or -connect"},
+		{"two inputs", []string{"-source", "s", "-stdin", "-listen", "127.0.0.1:0"}, 2, "exactly one of -stdin, -listen or -connect"},
 		{"unknown classification", []string{"-source", "s", "-stdin", "-classification", "SECRET"}, 2, `-classification: preflight: classification level "SECRET"`},
 		{"track quality out of range", []string{"-source", "s", "-stdin", "-track-quality", "16"}, 2, "track quality must be 0 to 15"},
 		{"negative max entities", []string{"-source", "s", "-stdin", "-max-entities", "-1"}, 2, "max entities must not be negative"},

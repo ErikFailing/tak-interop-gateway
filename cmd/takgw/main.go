@@ -5,6 +5,7 @@
 //	takgw serve      run the gateway: CoT in, entities out as JSON lines or to Lattice
 //	takgw preflight  check entity JSON lines against the documented acceptance rules
 //	takgw readback   publish test entities and confirm what comes back
+//	takgw devcerts   write a throwaway CA and certificates for local mutual TLS
 package main
 
 import (
@@ -22,6 +23,7 @@ commands:
   serve      run the gateway: CoT in, entities out as JSON lines or to Lattice
   preflight  check entity JSON lines against the documented acceptance rules
   readback   publish test entities, read them back, and report what changed
+  devcerts   write a throwaway CA and certificates for trying mutual TLS locally
 
 Run "takgw <command> -h" for a command's flags.
 `
@@ -47,6 +49,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runPreflight(args[1:], stdin, stdout, stderr)
 	case "readback":
 		return runReadback(ctx, args[1:], stdout, stderr)
+	case "devcerts":
+		return runDevcerts(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0

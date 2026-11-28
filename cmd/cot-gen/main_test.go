@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/xml"
 	"io"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/erikfailing/tak-interop-gateway/internal/cot"
+	"github.com/erikfailing/tak-interop-gateway/internal/devcert"
+	"github.com/erikfailing/tak-interop-gateway/internal/transport"
 )
 
 // fixedStart makes every run deterministic.
@@ -112,6 +116,59 @@ func TestTCP(t *testing.T) {
 	}
 	if got := lines(<-received); len(got) != 3 {
 		t.Errorf("listener got %d events, want 3", len(got))
+	}
+}
+
+// TestTLS sends a run over mutual TLS to a listener that requires a client certificate from the development
+// authority.
+func TestTLS(t *testing.T) {
+	f, err := devcert.Generate(t.TempDir(), []string{"localhost", "127.0.0.1"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := transport.ServerTLS(f.ServerCert, f.ServerKey, f.CA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	received := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			received <- ""
+			return
+		}
+		defer conn.Close()
+		b, _ := io.ReadAll(conn)
+		received <- string(b)
+	}()
+	args := []string{"-ticks=1", "-units=2", fixedStart, "-tcp=" + ln.Addr().String(),
+		"-tls-cert=" + f.ClientCert, "-tls-key=" + f.ClientKey, "-tls-ca=" + f.CA}
+	var stderr bytes.Buffer
+	if code := run(context.Background(), args, io.Discard, &stderr); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if got := lines(<-received); len(got) != 3 {
+		t.Errorf("listener got %d events over TLS, want 3", len(got))
+	}
+}
+
+// TestTLSFlags checks that the TLS flags come as a set, with -tcp.
+func TestTLSFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"-tcp=127.0.0.1:1", "-tls-cert=c.pem"},
+		{"-tls-cert=c.pem", "-tls-key=k.pem", "-tls-ca=ca.pem"},
+		{"-tls-server-name=x"},
+		{"-tcp=127.0.0.1:1", "-tls-cert=missing.pem", "-tls-key=missing.key", "-tls-ca=missing.pem"},
+	} {
+		var stderr bytes.Buffer
+		if code := run(context.Background(), append([]string{"-ticks=1"}, args...), io.Discard, &stderr); code != 2 {
+			t.Errorf("%v: exit code %d, want 2 (stderr: %s)", args, code, stderr.String())
+		}
 	}
 }
 

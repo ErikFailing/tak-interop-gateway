@@ -5,11 +5,13 @@
 //
 //	cot-gen -ticks 3                                # three ticks to stdout, all at once
 //	cot-gen -tcp 127.0.0.1:8087 -realtime -ticks 0  # stream to a local TAK server until Ctrl-C
+//	cot-gen -tcp 127.0.0.1:8089 -tls-cert client.pem -tls-key client.key -tls-ca ca.pem  # the same over mutual TLS
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/xml"
 	"errors"
 	"flag"
@@ -23,6 +25,7 @@ import (
 	"time"
 
 	"github.com/erikfailing/tak-interop-gateway/internal/cotgen"
+	"github.com/erikfailing/tak-interop-gateway/internal/transport"
 )
 
 func main() {
@@ -46,6 +49,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	start := fs.String("start", "", "timestamp of the first tick in RFC 3339 (default: now)")
 	tcpAddr := fs.String("tcp", "", "send to this host:port over TCP instead of stdout")
 	realtime := fs.Bool("realtime", false, "wait -interval between ticks instead of writing them all at once")
+	tlsCert := fs.String("tls-cert", "", "with -tcp, connect with mutual TLS presenting this certificate, PEM")
+	tlsKey := fs.String("tls-key", "", "the private key for -tls-cert, PEM")
+	tlsCA := fs.String("tls-ca", "", "the authority, PEM, the server's certificate must be signed by")
+	tlsServerName := fs.String("tls-server-name", "", "the name the server's certificate must carry, if not the host dialed")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -77,13 +84,37 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, 2, "%v", err)
 	}
 
-	// 2: Pick the destination. A TCP connection gets the same newline-separated events as stdout.
+	// 2: Pick the destination. A TCP connection, plain or mutual TLS, gets the same newline-separated events as stdout.
+	tlsSet := 0
+	for _, f := range []string{*tlsCert, *tlsKey, *tlsCA} {
+		if f != "" {
+			tlsSet++
+		}
+	}
+	switch {
+	case tlsSet != 0 && tlsSet != 3:
+		return fail(stderr, 2, "-tls-cert, -tls-key and -tls-ca go together: give all three")
+	case (tlsSet == 3 || *tlsServerName != "") && *tcpAddr == "":
+		return fail(stderr, 2, "the -tls flags need -tcp")
+	}
 	out := stdout
 	if *tcpAddr != "" {
-		dialer := net.Dialer{Timeout: 5 * time.Second}
-		conn, err := dialer.DialContext(ctx, "tcp", *tcpAddr)
-		if err != nil {
-			return fail(stderr, 1, "connect: %v", err)
+		var conn net.Conn
+		netDialer := &net.Dialer{Timeout: 5 * time.Second}
+		if tlsSet == 3 {
+			cfg, err := transport.ClientTLS(*tlsCert, *tlsKey, *tlsCA, *tlsServerName)
+			if err != nil {
+				return fail(stderr, 2, "%v", err)
+			}
+			conn, err = (&tls.Dialer{NetDialer: netDialer, Config: cfg}).DialContext(ctx, "tcp", *tcpAddr)
+			if err != nil {
+				return fail(stderr, 1, "connect: %v", err)
+			}
+		} else {
+			conn, err = netDialer.DialContext(ctx, "tcp", *tcpAddr)
+			if err != nil {
+				return fail(stderr, 1, "connect: %v", err)
+			}
 		}
 		defer conn.Close()
 		out = conn

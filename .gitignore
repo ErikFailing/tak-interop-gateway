@@ -14,3 +14,9 @@ coverage.*
 .env
 .env.*
 !.env.example
+
+# Certificates and private keys, including what takgw devcerts writes
+/devcerts/
+*.key
+*.p12
+*.pfx

@@ -6,5 +6,7 @@
 // disagree about where an element ends. Each frame is size-limited, and an error that loses the tokenizer's place ends
 // the stream instead of guessing where the next message starts.
 //
-// Connections to TAK servers and clients (TCP, and TLS with client certificates) are still to come.
+// ServerTLS and ClientTLS build the mutual-TLS configs for the two directions a gateway meets TAK: accepting clients
+// that must present a certificate from a given authority, and connecting to a TAK server with this side's
+// certificate while trusting only the server's authority. Neither can be told to skip verification.
 package transport
