@@ -30,14 +30,16 @@ Keeping the core free of network and SDK code means:
 | `cmd/cot-gen` | Writes a synthetic, labeled search-and-rescue scenario as CoT, to stdout or a TCP listener |
 | `internal/cotgen` | The deterministic scenario behind `cot-gen` |
 | `preflight` | Entity Preflight: the documented acceptance rules for a candidate entity, each with an ID, a severity and pinned links to the public documentation it encodes. See [rules.md](rules.md) and the section below. Public, so other Go projects can import it. |
-| `readback` | Round-trip verification of the project's own test entities. Public. |
+| `readback` | Publishes entities, reads each back in a separate request, and diffs them field by field: dropped and changed fields fail, added ones (such as a server-filled `createdTime`) are reported. Timestamps naming the same instant, and numbers with the same value, count as equal however they're written. SDK-free: it talks through a two-method `Client` interface. Public. |
 | `internal/transport` | `Framer`: splits a TCP stream into one size-limited message per event, using the parser's own tokenizer. Connections to TAK servers and clients (TCP, TLS with client certificates) are still to come. |
 | `internal/cot` | The CoT event model (shared by the generator and the parser), and `Parse`: size, depth and element limits, one unnamespaced root, no directives or duplicates, then field validation |
 | `entity` | An SDK-free model of the Lattice entity fields this project sets, with the REST API's JSON field names. Public, so Entity Preflight and other Go projects can use it. |
 | `internal/mapping` | CoT event to candidate entity. See the mapping table below. |
 | `internal/pipeline` | One message's whole path: parse, map, state, Entity Preflight as a gate, publish. Reads the clock once per message, so every stage agrees on "now", and wraps every refusal with its stage (`ErrParse`, `ErrMap`, `ErrDropped`, `ErrRejected`, `ErrPublish`) as well as the stage's own reason. `takgw serve` runs one pipeline per feed. |
 | `internal/state` | The `Tracker`: drops a report that repeats or predates the last published one, and holds back one that changes nothing until a refresh is due. Memory is bounded. See the section below. |
-| `internal/publish` | The `Publisher` interface, with `Memory` (the in-process fake for tests) and `JSONL` (offline output, in the format `takgw preflight` reads). The SDK adapter, `internal/publish/latticesdk`, is still to come. |
+| `internal/publish` | The `Publisher` interface, with `Memory` (the in-process fake for tests) and `JSONL` (offline output, in the format `takgw preflight` reads). |
+| `internal/publish/latticesdk` | The SDK adapter: publishes (`PUT /api/v1/entities`) and reads back (`GET /api/v1/entities/{id}`) through the official Go SDK. Credentials come from `LATTICE_ENDPOINT`, `ENVIRONMENT_TOKEN` and `SANDBOXES_TOKEN`; the config redacts them when printed, and errors never carry them. Plain http is refused except to loopback. Errors are classified as rejected (400), unauthorized (401) or not found (404), so callers can tell a bad entity from bad credentials. |
+| `internal/latticefake` | An in-process stand-in for those two endpoints. It enforces both credentials, requires an `entityId`, stores what it's given and adds `createdTime`, the one server behavior the SDK documents. It does not validate entities: that's preflight's job, and only a live readback shows what the platform really does. |
 | `internal/health` | Publishes the gateway itself as an asset with a health component |
 
 ## Mapping
@@ -141,7 +143,31 @@ from the code, and a test fails if the committed copy is stale.
   about to expire. CI runs it for 30 seconds on every push.
 - `takgw serve` is tested end to end: a `cot-gen` scenario on stdin whose output then passes `takgw preflight
   -strict`, a live TCP connection stopped by cancelling its context, the connection limit, the idle timeout, every
-  usage error, a malformed stream and a failing output.
+  usage error, a malformed stream and a failing output. With `-lattice`, against the fake: entities published,
+  refused credentials stopping the gateway, and rejected entities logged while it carries on.
+- The SDK adapter is tested against the fake and against bare HTTP handlers. One test converts mapped entities, and
+  one with every model field set, to the SDK's type and back to JSON, and requires the SDK's JSON to match the
+  model's field for field: preflight checks the model's JSON, so this makes its verdict hold for the bytes actually
+  sent. Others pin the request (method, path, both credential headers), the error classes, the base-URL rules, and
+  that neither a printed config nor an error message ever contains a token.
+- `takgw readback` is tested offline, and in live mode against fakes that store faithfully, drop a field, and refuse
+  the credentials.
+
+## Publishing to Lattice
+
+`latticesdk.Client` converts each entity to the SDK's `Entity` by marshaling the model to JSON and unmarshaling it
+into the SDK type, rather than copying fields by hand. The model's JSON names are the REST API's, and
+`TestModelMatchesSDK` in `preflight` proves the SDK declares every one, so nothing can be silently left behind, and
+there is no mapping code to fall out of date when the SDK changes.
+
+The static environment token is passed with `option.WithToken`, which sets the `Authorization` header on every
+request; set that way, it takes precedence over the SDK's OAuth client-credentials flow, which then never runs. The
+Sandboxes token goes on the client itself, in `anduril-sandbox-authorization`, so it covers every request, as the
+guide asks.
+
+With `serve -lattice`, a publish failure is fatal only when the platform refuses the credentials, since every later
+request would fail the same way. A rejected entity (HTTP 400) is logged and counted, and the gateway carries on. The
+SDK itself makes up to two attempts, so one retry with backoff, on a 408, 429 or 5xx response.
 
 ## State
 

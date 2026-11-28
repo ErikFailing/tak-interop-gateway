@@ -4,7 +4,7 @@
 
 Entity Preflight checks a candidate Lattice entity against these rules before it is published. They encode Anduril's public integration guide and the field comments in the Go SDK, and were checked against lattice-sdk-go v5.5.0. Every link is pinned to the commit or tag the rule was read from. The enum rule asks the installed SDK which values exist, and the known-fields rule asks it which fields do, so neither keeps a copy of Anduril's lists.
 
-The documentation can lag the server, so passing preflight is necessary, not sufficient. The planned `takgw readback` publishes to a real environment and reads the entity back, which is the final word.
+The documentation can lag the server, so passing preflight is necessary, not sufficient. `takgw readback -live` publishes test entities to a real environment and reads them back, which is the final word.
 
 ## Errors
 

@@ -4,21 +4,23 @@ A gateway that translates TAK Cursor-on-Target (CoT) traffic into entities for t
 validator, Entity Preflight, that checks every entity against the platform's documented acceptance rules before it is
 sent.
 
-> **Status: early development.** The gateway runs end to end offline: `takgw serve` reads CoT from stdin or TCP,
-> maps it, filters it, checks it with Entity Preflight, and writes the entities as JSON lines. Publishing to Lattice
-> through the SDK, TLS with client certificates, and `takgw readback` are not implemented yet.
+> **Status: early development.** The whole path works: `takgw serve` reads CoT from stdin or TCP, maps it, filters
+> it, checks it with Entity Preflight, and publishes it, as JSON lines or to Lattice through the official Go SDK, and
+> `takgw readback` checks what the platform stored. Everything is tested against an in-process fake of the Lattice
+> REST API; it has not yet been run against a live environment. TLS with client certificates on the TAK side is
+> still to come.
 
 ## Components
 
 One binary, `takgw`, with three commands:
 
 - `takgw serve`: the gateway. Reads CoT from stdin or plain TCP, maps each event to an entity, drops repeats, late
-  arrivals and unchanged reports, checks what's left with Entity Preflight, and publishes it. For now it publishes
-  offline, as JSON lines; the Lattice SDK adapter is next.
+  arrivals and unchanged reports, checks what's left with Entity Preflight, and publishes it: as JSON lines by
+  default, or to a Lattice environment with `-lattice`.
 - `takgw preflight`: Entity Preflight as a standalone tool. Reads entity JSON and reports any entity that breaks a
   documented rule, so other integrations can run it in their own CI.
-- `takgw readback` (planned): a round-trip check. Publishes the project's own test entities and confirms that what
-  comes back matches what was sent.
+- `takgw readback`: a round-trip check. Publishes the project's own simulated test entities, reads each back in a
+  separate request, and reports any field the platform dropped or changed.
 
 ## Running the gateway offline
 
@@ -42,6 +44,37 @@ go run ./cmd/cot-gen -tcp 127.0.0.1:8087 -realtime -ticks 0                     
 `-listen` takes plain TCP with no authentication, so anyone who can reach the port can inject tracks: bind it to a
 loopback address or a trusted network (serve warns when it isn't loopback). `-source` names the feed and is part of
 every entity ID, so keep it stable. Pass `-simulated` for test data. Run `takgw serve -h` for every flag.
+
+## Publishing to Lattice, and readback
+
+`takgw readback` publishes six simulated test entities, built by the real parser and mapper, then reads each back
+and diffs it field by field. With no flags it runs against an in-process fake of the Lattice REST API, through the
+real SDK adapter, with random tokens, so the whole path, both credentials included, is exercised without an
+environment:
+
+```console
+$ go run ./cmd/takgw readback
+takgw readback: offline, against an in-process fake of the Lattice REST API (-live for a real environment)
+PASS  SIM-SAR-1              9ee568df-43fb-592b-8503-f5ce4d660ba3  (1 field(s) added by the platform; -v lists them)
+...
+takgw readback: 6 entities: 6 passed, 0 failed
+```
+
+A field the platform drops or changes fails the run; a field it adds, such as `createdTime`, is listed with `-v` but
+allowed. For a real environment, use a development sandbox you own, with credentials in the environment, never in a
+file in the repository:
+
+```bash
+export LATTICE_ENDPOINT=<environment_id>.env.sandboxes.developer.anduril.com   # a hostname, no https://
+export ENVIRONMENT_TOKEN=...                                                   # the environment's bearer token
+export SANDBOXES_TOKEN=...                                                     # Sandboxes only
+go run ./cmd/takgw readback -live                                              # test entities expire after 2 minutes
+cot-gen -ticks 0 -realtime | takgw serve -stdin -source demo -simulated -lattice
+```
+
+The adapter sends the environment token as the bearer token and the Sandboxes token in `anduril-sandbox-authorization`,
+as Anduril's guide says; it never logs either, and refuses plain http to anything but loopback. With `-lattice`, an
+entity the platform rejects is logged and counted, and the gateway carries on; refused credentials stop it.
 
 ## Entity Preflight
 
@@ -78,6 +111,8 @@ Passing preflight is necessary, not sufficient: the documentation can lag the se
 - **A narrow SDK boundary.** The official Lattice Go SDK is imported only by Entity Preflight, which asks it for enum
   values and field names, and by the publish adapter. A depguard lint rule enforces this. No SDK code, generated stubs
   or `.proto` files are committed to this repository.
+- **What preflight checks is what gets sent.** The adapter converts entities to the SDK's type through JSON, with no
+  hand-written field mapping, and a test proves the SDK's request body matches the model's JSON field for field.
 
 See [docs/architecture.md](docs/architecture.md).
 

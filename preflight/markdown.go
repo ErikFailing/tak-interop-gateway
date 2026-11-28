@@ -27,7 +27,8 @@ func RulesMarkdown() string {
 		"installed SDK which values exist, and the known-fields rule asks it which fields do, so neither keeps a copy "+
 		"of Anduril's lists.\n\n", SDKVersion)
 	b.WriteString("The documentation can lag the server, so passing preflight is necessary, not sufficient. " +
-		"The planned `takgw readback` publishes to a real environment and reads the entity back, which is the final word.\n")
+		"`takgw readback -live` publishes test entities to a real environment and reads them back, which is the final " +
+		"word.\n")
 	for _, sev := range []Severity{Error, Warning, Info} {
 		fmt.Fprintf(&b, "\n## %s\n\n%s\n\n", severityHeading[sev], severityIntro[sev])
 		b.WriteString("| Rule | Requires | Sources |\n|---|---|---|\n")

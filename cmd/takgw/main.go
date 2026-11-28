@@ -2,11 +2,9 @@
 //
 // Usage:
 //
-//	takgw serve      run the gateway (offline for now: entities are written as JSON lines)
+//	takgw serve      run the gateway: CoT in, entities out as JSON lines or to Lattice
 //	takgw preflight  check entity JSON lines against the documented acceptance rules
 //	takgw readback   publish test entities and confirm what comes back
-//
-// serve and preflight are implemented; readback is not yet.
 package main
 
 import (
@@ -21,9 +19,9 @@ import (
 const usage = `usage: takgw <command> [flags]
 
 commands:
-  serve      run the gateway; offline for now, writing entities as JSON lines
+  serve      run the gateway: CoT in, entities out as JSON lines or to Lattice
   preflight  check entity JSON lines against the documented acceptance rules
-  readback   round-trip check of test entities (not implemented yet)
+  readback   publish test entities, read them back, and report what changed
 
 Run "takgw <command> -h" for a command's flags.
 `
@@ -48,8 +46,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "preflight":
 		return runPreflight(args[1:], stdin, stdout, stderr)
 	case "readback":
-		fmt.Fprintf(stderr, "takgw %s: not implemented yet\n", args[0])
-		return 1
+		return runReadback(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0

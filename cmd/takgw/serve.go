@@ -18,6 +18,7 @@ import (
 	"github.com/erikfailing/tak-interop-gateway/internal/mapping"
 	"github.com/erikfailing/tak-interop-gateway/internal/pipeline"
 	"github.com/erikfailing/tak-interop-gateway/internal/publish"
+	"github.com/erikfailing/tak-interop-gateway/internal/publish/latticesdk"
 	"github.com/erikfailing/tak-interop-gateway/internal/state"
 	"github.com/erikfailing/tak-interop-gateway/internal/transport"
 	"github.com/erikfailing/tak-interop-gateway/preflight"
@@ -27,14 +28,16 @@ import (
 const serveUsage = `usage: takgw serve -source NAME (-stdin | -listen HOST:PORT) [flags]
 
 Runs the gateway: reads a CoT stream, maps each event to a Lattice entity, drops repeats, late arrivals and unchanged
-reports, checks what's left with Entity Preflight, and publishes it. For now the only publisher is offline: each
-entity is written as one JSON line to -out, the format "takgw preflight" reads.
+reports, checks what's left with Entity Preflight, and publishes it. By default each entity is written as one JSON
+line to -out, the format "takgw preflight" reads. With -lattice it is published to the Lattice environment named by
+LATTICE_ENDPOINT, ENVIRONMENT_TOKEN and, for Sandboxes, SANDBOXES_TOKEN.
 
 -listen accepts plain TCP with no authentication, so anyone who can reach the port can inject tracks. Bind it to a
 loopback address or a trusted network; TLS with client certificates is still to come.
 
 Exit status: 0 after a clean stop (end of stdin, or Ctrl-C), 1 for a runtime failure (a malformed stdin stream, a
-listener or output error), 2 for a usage error.
+listener or output error, or credentials the platform refuses), 2 for a usage error. With -lattice, an entity the
+platform rejects is counted and logged, and the gateway carries on.
 
 flags:
 `
@@ -55,6 +58,7 @@ type serveConfig struct {
 	stdin       bool
 	listen      string
 	out         string
+	lattice     bool
 	maxConns    int
 	idleTimeout time.Duration
 	verbose     bool
@@ -72,18 +76,31 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	}
 	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
 
-	// 1: Open the output and build the pipeline.
-	out := stdout
-	if cfg.out != "-" {
-		f, err := os.OpenFile(cfg.out, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	// 1: Choose the publisher, and which of its failures stop the gateway. Writing to a file or a pipe fails for good
+	// once it fails, so any failure stops. Lattice can reject one entity and accept the next, so only refused
+	// credentials, which fail every request, stop.
+	fatal := func(error) bool { return true }
+	if cfg.lattice {
+		client, err := newLiveClient()
 		if err != nil {
-			fmt.Fprintf(stderr, "takgw serve: -out: %v\n", err)
-			return 1
+			fmt.Fprintf(stderr, "takgw serve: -lattice: %v\n", err)
+			return 2
 		}
-		defer f.Close() // every entity is written in one Write as it's published, so there's nothing left to flush
-		out = f
+		cfg.pipeline.Publisher = client
+		fatal = func(err error) bool { return errors.Is(err, latticesdk.ErrUnauthorized) }
+	} else {
+		out := stdout
+		if cfg.out != "-" {
+			f, err := os.OpenFile(cfg.out, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+			if err != nil {
+				fmt.Fprintf(stderr, "takgw serve: -out: %v\n", err)
+				return 1
+			}
+			defer f.Close() // every entity is written in one Write as it's published, so there's nothing left to flush
+			out = f
+		}
+		cfg.pipeline.Publisher = publish.NewJSONL(out)
 	}
-	cfg.pipeline.Publisher = publish.NewJSONL(out)
 	p, err := pipeline.New(cfg.pipeline)
 	if err != nil {
 		fmt.Fprintf(stderr, "takgw serve: %v\n", err)
@@ -123,17 +140,19 @@ func runServe(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		close(frames)
 	}()
 
-	// 3: Process messages in arrival order until the readers are done or the context ends. A publish failure stops
-	// everything: the only publisher today writes a file or a pipe, and once that fails every later publish would too.
+	// 3: Process messages in arrival order until the readers are done or the context ends, or a fatal publish failure.
 	c := counters{dropped: map[string]int{}}
 	code = 0
 	process := func(ctx context.Context, msg []byte) bool {
 		c.messages++
 		res, err := p.Process(ctx, msg)
 		if count(&c, log, res, err) {
-			log.Error("publish failed, stopping", "err", err)
-			code = 1
-			return false
+			if fatal(err) {
+				log.Error("publish failed, stopping", "err", err)
+				code = 1
+				return false
+			}
+			log.Warn("publish failed", "entity", idOf(res.Entity), "err", err)
 		}
 		return true
 	}
@@ -204,10 +223,7 @@ func drops(m map[string]int) string {
 // count records one outcome and logs it at debug level, or warns for what an operator should see. It returns true
 // if publishing failed.
 func count(c *counters, log *slog.Logger, res pipeline.Result, err error) bool {
-	id := ""
-	if res.Entity.EntityID != nil {
-		id = *res.Entity.EntityID
-	}
+	id := idOf(res.Entity)
 	switch {
 	case err == nil:
 		c.published++
@@ -244,6 +260,14 @@ func count(c *counters, log *slog.Logger, res pipeline.Result, err error) bool {
 	return false
 }
 
+// idOf is an entity's ID, for logs.
+func idOf(e entity.Entity) string {
+	if e.EntityID == nil {
+		return ""
+	}
+	return *e.EntityID
+}
+
 // name is an entity's display name, for logs.
 func name(e entity.Entity) string {
 	if e.Aliases == nil || e.Aliases.Name == nil {
@@ -260,6 +284,7 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 	useStdin := fs.Bool("stdin", false, "read one CoT stream from stdin, and stop at its end")
 	listen := fs.String("listen", "", "accept CoT streams over plain TCP on this host:port")
 	out := fs.String("out", "-", `append published entities as JSON lines to this file; "-" is stdout`)
+	lattice := fs.Bool("lattice", false, "publish to the Lattice environment in LATTICE_ENDPOINT, ENVIRONMENT_TOKEN and SANDBOXES_TOKEN instead of -out")
 	simulated := fs.Bool("simulated", false, "mark every entity as simulated (do this for test data such as cot-gen's)")
 	trackQuality := fs.Int("track-quality", mapping.DefaultTrackQuality, "tracked.trackQualityWrapper for every track, 0 to 15")
 	classification := fs.String("classification", string(entity.ClassificationUnclassified), "dataClassification level for every entity")
@@ -296,6 +321,8 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 		return usage("-max-conns must be at least 1")
 	case *idle <= 0:
 		return usage("-idle-timeout must be positive")
+	case *lattice && flagSet(fs, "out"):
+		return usage("choose -lattice or -out, not both")
 	}
 	level := entity.ClassificationLevel(*classification)
 	if err := preflight.CheckClassification(level); err != nil {
@@ -310,7 +337,8 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 			Limits: cot.DefaultLimits,
 			State:  state.Config{Refresh: *refresh, MaxEntities: *maxEntities},
 		},
-		stdin: *useStdin, listen: *listen, out: *out, maxConns: *maxConns, idleTimeout: *idle, verbose: *verbose,
+		stdin: *useStdin, listen: *listen, out: *out, lattice: *lattice, maxConns: *maxConns, idleTimeout: *idle,
+		verbose: *verbose,
 	}
 
 	// The pipeline checks these again, but checking now keeps a usage error from creating the -out file first.
@@ -321,6 +349,17 @@ func parseServeFlags(args []string, stderr io.Writer) (serveConfig, int) {
 		return usage("%v", err)
 	}
 	return cfg, -1
+}
+
+// flagSet reports whether the named flag was given on the command line, as opposed to left at its default.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 // server holds what the readers share.

@@ -20,7 +20,7 @@ func TestRun(t *testing.T) {
 		{name: "help", args: []string{"help"}, wantCode: 0, wantStdout: "usage: takgw"},
 		{name: "serve dispatches", args: []string{"serve"}, wantCode: 2, wantStderr: "-source is required"},
 		{name: "preflight dispatches", args: []string{"preflight"}, wantCode: 0, wantStderr: "0 entities checked"},
-		{name: "readback not implemented", args: []string{"readback"}, wantCode: 1, wantStderr: "not implemented yet"},
+		{name: "readback dispatches", args: []string{"readback", "-bogus"}, wantCode: 2, wantStderr: "flag provided but not defined"},
 		{name: "unknown command", args: []string{"bogus"}, wantCode: 2, wantStderr: `unknown command "bogus"`},
 	}
 	for _, tt := range tests {
