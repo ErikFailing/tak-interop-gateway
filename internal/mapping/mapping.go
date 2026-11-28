@@ -98,7 +98,8 @@ func Map(ev cot.Event, cfg Config, now time.Time) (entity.Entity, error) {
 	if !expiry.After(now) {
 		return entity.Entity{}, fmt.Errorf("%w: stale %s is not after %s", ErrExpired, expiry.Format(time.RFC3339), now.Format(time.RFC3339))
 	}
-	if limit := now.Add(MaxExpiry); expiry.After(limit) {
+	// UTC, so the clamped expiry carries no local zone and no monotonic clock reading, like every other time here.
+	if limit := now.UTC().Add(MaxExpiry); expiry.After(limit) {
 		expiry = limit
 	}
 
@@ -219,12 +220,8 @@ func sidcFor(atoms []string) (string, bool) {
 			return "", false
 		}
 	}
-	affiliation := strings.ToUpper(atoms[1])
-	if affiliation == "O" || affiliation == "X" {
-		affiliation = "U" // 2525C has no "none" or "other" identity
-	}
 	var b strings.Builder
-	b.WriteString("S" + affiliation + strings.ToUpper(atoms[2]) + "P")
+	b.WriteString("S" + sidcAffiliation(atoms[1]) + strings.ToUpper(atoms[2]) + "P")
 	for _, atom := range atoms[3:] {
 		b.WriteString(strings.ToUpper(atom))
 	}
@@ -238,15 +235,21 @@ func sidcFor(atoms []string) (string, bool) {
 // with the function left unspecified, so a-f becomes SFZP----------- and a-f-G-UC becomes SFGP-----------. Map only
 // calls it after the affiliation and dimension letters have been validated.
 func genericSIDC(atoms []string) string {
-	affiliation := strings.ToUpper(atoms[1])
-	if affiliation == "O" || affiliation == "X" {
-		affiliation = "U"
-	}
 	dimension := "Z" // unknown
 	if len(atoms) >= 3 {
 		dimension = strings.ToUpper(atoms[2])
 	}
-	return "S" + affiliation + dimension + "P" + strings.Repeat("-", 11)
+	return "S" + sidcAffiliation(atoms[1]) + dimension + "P" + strings.Repeat("-", 11)
+}
+
+// sidcAffiliation is the SIDC's affiliation letter for a CoT affiliation atom: the same letter, upper-cased, except
+// that "none specified" (o) and "other" (x) become unknown (U), since MIL-STD-2525C has no identity for either.
+func sidcAffiliation(atom string) string {
+	a := strings.ToUpper(atom)
+	if a == "O" || a == "X" {
+		return "U"
+	}
+	return a
 }
 
 // isAlnum reports whether b is an ASCII letter or digit.

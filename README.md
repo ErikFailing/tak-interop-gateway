@@ -70,8 +70,10 @@ go run ./cmd/cot-gen -tcp 127.0.0.1:8089 -realtime -ticks 0 \
 ```
 
 serve logs each client's certificate name, and refuses a client without a trusted certificate at the handshake,
-which must finish within 10 seconds. Against a TAK server's streaming port (often 8089), with a client certificate
-the server's authority issued:
+which must finish within 5 seconds. A client takes one of the `-max-conns` slots only once its handshake is done, and
+the handshakes in progress are capped, in all and from any one address, so clients that connect and stall can't lock
+out the ones with certificates. Against a TAK server's streaming port (often 8089), with a client certificate the
+server's authority issued:
 
 ```bash
 go run ./cmd/takgw serve -source tak-main -connect tak.example.org:8089 \
@@ -93,25 +95,31 @@ openssl pkcs12 -in truststore.p12 -nokeys -out tak-ca.pem             # the serv
 ## Feed integrity, and the gateway on the picture
 
 A gateway is a trust boundary: whatever it accepts, the operating picture shows. Besides parsing strictly and
-checking every entity with preflight, serve drops two kinds of report that parse fine but shouldn't be believed:
+checking every entity with preflight, serve drops three kinds of report that parse fine but shouldn't be believed:
 
 - **Impossible jumps.** A report whose position implies a speed nothing in its environment can reach, judged by the
   source's own timestamps less both reports' position uncertainty: a GPS glitch, a replayed track, a spoofed
   position. The limits are generous (about Mach 3.2 in the air, 500 km/h on land, 97 knots on the water, 49 knots
-  below it, none in space), so only the physically impossible trips them.
+  below it, none in space), so only the physically impossible trips them. Each report's uncertainty excuses at most a
+  kilometer, and a report that changes environment is held to the stricter of the two limits, so neither claiming
+  vast uncertainty nor retyping a ground unit as a satellite gets a jump through.
 - **Impersonation.** Each track is bound to the identity it is published from: the client certificate under mutual
-  TLS, or the remote IP on plain TCP. While that identity keeps reporting, another one sending the same uid is
-  dropped. The binding lapses after 90 seconds of silence, so a device that reconnects gets its track back and nobody
-  can squat a uid.
+  TLS (its common name, or its fingerprint if it has none), or the remote IP on plain TCP. While that identity keeps
+  reporting, another one sending the same uid is dropped. The binding lapses after 90 seconds of silence, so a device
+  that reconnects gets its track back and nobody can squat a uid.
+- **Future stamps.** A report stamped more than 5 minutes ahead of the gateway's clock. Published, it would make every
+  honest report after it look out of date, freezing the track until the false time passed.
 
-Both are logged as warnings, and both show on the gateway's own asset. With `-health-position lat,lon[,hae]`, serve
-publishes itself every 30 seconds as a friendly ground asset whose health rolls up three components: input (failing
-while the TAK server connection is down), feed integrity (a warning while impossible jumps, impersonation, or a
-spike of unparsable or rejected messages arrive), and publishing (failing while publishes fail). On a clean stop it
-publishes itself once more as offline; if the gateway dies, the asset expires within 90 seconds. Its ID comes from a
-namespace of its own, so no CoT uid can overwrite it.
+All three are logged as warnings, and all three show on the gateway's own asset. With `-health-position
+lat,lon[,hae]`, serve publishes itself every 30 seconds as a friendly ground asset whose health rolls up three
+components: input (failing while the TAK server connection is down, and a warning until the first attempt to connect
+has finished), feed integrity (a warning while any of these reports, new entities refused at the entity limit,
+connections ended by unreadable input or failed handshakes, or a spike of unparsable or rejected messages arrive),
+and publishing (a warning while some publishes fail, failing while none get through). On a clean stop it publishes
+itself once more as offline; if the gateway dies, the asset expires within 90 seconds. Its ID comes from a namespace
+of its own, so no CoT uid can overwrite it.
 
-`hostile-sender` fires 19 hostile cases at a gateway you run, each with the outcome the gateway must give; the same
+`hostile-sender` fires 20 hostile cases at a gateway you run, each with the outcome the gateway must give; the same
 catalogue is a test suite. Over mutual TLS, with the second identity `devcerts` writes for the impersonation case:
 
 ```bash
@@ -128,14 +136,16 @@ From one such run, with `cot-gen` streaming a normal feed alongside:
 ```text
 level=WARN msg="dropped a suspect report" name=HOSTILE-TEST reason=implausible err="... the report implies a speed nothing in its environment can reach ..."
 level=WARN msg="dropped a suspect report" name=HOSTILE-TEST reason=origin-conflict err="... the entity is being published from another origin ..."
+level=WARN msg="dropped a suspect report" name=HOSTILE-TEST reason=future-time err="... the report is stamped further ahead of the gateway's clock than a clock should drift ..."
 level=WARN msg="connection closed on error" err="transport: malformed CoT stream: XML syntax error on line 1: invalid character entity &lol9;"
 level=WARN msg="connection closed on error" err="transport: CoT message exceeds the size limit: limit 65536 bytes"
-takgw serve: 91 messages: 62 published, 17 dropped (repeated 1, out-of-order 1, unchanged 13, implausible 1, origin-conflict 1), 10 unparsable, 2 unmappable, 0 rejected by preflight, 0 publish errors, 2 stream errors; 10 entities tracked
+takgw serve: 62 messages: 39 published, 11 dropped (repeated 1, out-of-order 1, unchanged 6, future-time 1, implausible 1, origin-conflict 1), 10 unparsable, 2 unmappable, 0 rejected by preflight, 0 publish errors, 2 stream errors; 10 entities tracked
 ```
 
-The gateway's asset went from healthy to a warning ("in the last 5s: 1 implausible jump, 1 report from another
-origin for a live track, 3 unparsable messages"), back to healthy, and to offline at the stop. `hostile-sender -list`
-describes every case.
+The gateway's asset went from healthy to a warning for two intervals ("in the last 5s: 1 implausible jump, 1 report
+from another origin for a live track, 1 report stamped too far in the future, 3 unparsable messages", then "2
+connections ended by unreadable input or failed handshakes, 7 unparsable messages"), back to healthy, and to offline
+at the stop. `hostile-sender -list` describes every case.
 
 ## Publishing to Lattice, and readback
 

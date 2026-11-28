@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/big"
 	"slices"
-	"strconv"
 	"time"
 
 	"github.com/erikfailing/tak-interop-gateway/entity"
+	"github.com/erikfailing/tak-interop-gateway/internal/jsonpath"
 )
 
 // Client publishes an entity and reads one back.
@@ -112,14 +113,14 @@ func compare(path string, a, b any, out *[]Difference) {
 		}
 		for _, k := range slices.Sorted(maps.Keys(av)) {
 			if bval, ok := bv[k]; ok {
-				compare(join(path, k), av[k], bval, out)
+				compare(jsonpath.Key(path, k), av[k], bval, out)
 			} else {
-				*out = append(*out, Difference{Path: join(path, k), Kind: Dropped, Sent: show(av[k])})
+				*out = append(*out, Difference{Path: jsonpath.Key(path, k), Kind: Dropped, Sent: show(av[k])})
 			}
 		}
 		for _, k := range slices.Sorted(maps.Keys(bv)) {
 			if _, ok := av[k]; !ok {
-				*out = append(*out, Difference{Path: join(path, k), Kind: Added, Got: show(bv[k])})
+				*out = append(*out, Difference{Path: jsonpath.Key(path, k), Kind: Added, Got: show(bv[k])})
 			}
 		}
 	case []any:
@@ -129,7 +130,7 @@ func compare(path string, a, b any, out *[]Difference) {
 			return
 		}
 		for i := range max(len(av), len(bv)) {
-			p := fmt.Sprintf("%s[%d]", path, i)
+			p := jsonpath.Index(path, i)
 			switch {
 			case i >= len(bv):
 				*out = append(*out, Difference{Path: p, Kind: Dropped, Sent: show(av[i])})
@@ -146,19 +147,21 @@ func compare(path string, a, b any, out *[]Difference) {
 	}
 }
 
-// sameScalar compares two JSON scalars: numbers by value, strings exactly or as equal RFC 3339 instants, and booleans
+// sameScalar compares two JSON scalars: numbers by exact value, strings exactly or as equal RFC 3339 instants, and booleans
 // and null directly.
 func sameScalar(a, b any) bool {
 	switch av := a.(type) {
 	case json.Number:
+		// Exactly, as rationals: float64 would call 9007199254740993 and 9007199254740992 equal, hiding a large
+		// integer the platform rounded, and would overflow on 1e400.
 		bv, ok := b.(json.Number)
 		if !ok {
 			return false
 		}
-		fa, errA := av.Float64()
-		fb, errB := bv.Float64()
-		if errA == nil && errB == nil {
-			return fa == fb
+		ra, okA := new(big.Rat).SetString(string(av))
+		rb, okB := new(big.Rat).SetString(string(bv))
+		if okA && okB {
+			return ra.Cmp(rb) == 0
 		}
 		return av == bv
 	case string:
@@ -183,24 +186,6 @@ func show(v any) string {
 		return fmt.Sprintf("%v", v)
 	}
 	return string(b)
-}
-
-// join appends key to a JSON path: dotted for a plain key, and quoted in brackets for any other, so every path is
-// non-empty and reads back unambiguously.
-func join(path, key string) string {
-	plain := key != ""
-	for i := range len(key) {
-		if b := key[i]; b != '_' && (b < 'a' || b > 'z') && (b < 'A' || b > 'Z') && (b < '0' || b > '9') {
-			plain = false
-		}
-	}
-	switch {
-	case !plain:
-		return path + "[" + strconv.Quote(key) + "]"
-	case path == "":
-		return key
-	}
-	return path + "." + key
 }
 
 // Result is the readback of one entity.
@@ -228,9 +213,11 @@ func (r Result) Passed() bool {
 // real platform time to settle; the read happens in a separate request, so the answer reflects what was stored, not
 // the publish call's echo. The context bounds the whole run. Every entity must have an entityId.
 func Run(ctx context.Context, c Client, entities []entity.Entity, wait time.Duration) []Result {
-	// 1: Publish everything first, so one entity's read doesn't race the next one's publish.
+	// 1: Publish everything first, so one entity's read doesn't race the next one's publish. Each ID may appear once:
+	// a second publish of the same ID would overwrite the first, and the first would then fail its comparison.
 	results := make([]Result, len(entities))
 	sent := make([][]byte, len(entities))
+	seen := map[string]bool{}
 	for i, e := range entities {
 		r := &results[i]
 		if e.EntityID != nil {
@@ -243,9 +230,12 @@ func Run(ctx context.Context, c Client, entities []entity.Entity, wait time.Dura
 		switch {
 		case r.EntityID == "":
 			r.Err = errors.New("readback: the entity has no entityId")
+		case seen[r.EntityID]:
+			r.Err = errors.New("readback: an earlier entity in this run has the same entityId")
 		case err != nil:
 			r.Err = fmt.Errorf("readback: encode: %w", err)
 		default:
+			seen[r.EntityID] = true
 			sent[i] = b
 			if err := c.Publish(ctx, e); err != nil {
 				r.Err = fmt.Errorf("readback: publish: %w", err)

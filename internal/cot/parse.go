@@ -22,18 +22,34 @@ var (
 	ErrDirective        = errors.New("cot: XML directives (such as DOCTYPE) are not allowed")
 	ErrProcInst         = errors.New("cot: unexpected processing instruction")
 	ErrNotEvent         = errors.New("cot: root element must be an unnamespaced <event>")
-	ErrTrailingData     = errors.New("cot: data after the <event> element")
+	ErrStrayData        = errors.New("cot: data outside the <event> element")
 	ErrDuplicateAttr    = errors.New("cot: duplicate attribute")
 	ErrDuplicateElement = errors.New("cot: duplicate element")
 	ErrMissing          = errors.New("cot: required attribute or element missing")
 	ErrInvalidField     = errors.New("cot: invalid field value")
 )
 
-// Limits bounds how much work Parse does on one message, so a hostile or broken sender can't make it do a lot.
+// Limits bounds how much work Parse does on one message, so a hostile or broken sender can't make it do a lot. A field
+// left at zero, or set below it, takes its value from DefaultLimits, so Limits{MaxBytes: 1 << 20} raises the size
+// limit and keeps the others.
 type Limits struct {
 	MaxBytes    int // the largest message accepted
 	MaxDepth    int // the deepest element nesting accepted, counting <event> as 1
 	MaxElements int // the most elements accepted in one message
+}
+
+// orDefaults fills every unset field from DefaultLimits.
+func (lim Limits) orDefaults() Limits {
+	if lim.MaxBytes <= 0 {
+		lim.MaxBytes = DefaultLimits.MaxBytes
+	}
+	if lim.MaxDepth <= 0 {
+		lim.MaxDepth = DefaultLimits.MaxDepth
+	}
+	if lim.MaxElements <= 0 {
+		lim.MaxElements = DefaultLimits.MaxElements
+	}
+	return lim
 }
 
 // DefaultLimits are generous for real CoT. A typical position report is under 1 KiB, and the element cap leaves room
@@ -76,6 +92,7 @@ func Parse(data []byte) (Event, error) {
 // the required attributes and sane field values, and returns an error wrapping one of the Err values otherwise.
 func (lim Limits) Parse(data []byte) (Event, error) {
 	// 1: Check the size before doing any parsing work at all.
+	lim = lim.orDefaults()
 	if len(data) > lim.MaxBytes {
 		return Event{}, fmt.Errorf("%w: %d bytes, limit %d", ErrTooLarge, len(data), lim.MaxBytes)
 	}
@@ -83,9 +100,13 @@ func (lim Limits) Parse(data []byte) (Event, error) {
 	if err := lim.scan(data); err != nil {
 		return Event{}, err
 	}
-	// 3: The structure is known to be safe and as expected, so decode it into the model.
+	// 3: The structure is known to be safe and as expected, so decode it into the model. A number or time the model's
+	// own types refuse is an invalid field; anything else the decoder refuses is malformed.
 	var ev Event
 	if err := xml.Unmarshal(data, &ev); err != nil {
+		if errors.Is(err, ErrInvalidField) {
+			return Event{}, err
+		}
 		return Event{}, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	// 4: Check the decoded values.
@@ -117,7 +138,7 @@ func (lim Limits) scan(data []byte) error {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			if rootClosed {
-				return fmt.Errorf("%w: a second element <%s>", ErrTrailingData, t.Name.Local)
+				return fmt.Errorf("%w: a second element <%s>", ErrStrayData, t.Name.Local)
 			}
 			depth++
 			elements++
@@ -164,8 +185,8 @@ func (lim Limits) scan(data []byte) error {
 				rootClosed = true
 			}
 		case xml.CharData:
-			if depth == 0 && len(bytes.TrimSpace(t)) > 0 {
-				return fmt.Errorf("%w: text outside the <event> element", ErrTrailingData)
+			if depth == 0 && !IsXMLSpace(t) {
+				return fmt.Errorf("%w: text outside the <event> element", ErrStrayData)
 			}
 		case xml.Directive:
 			return ErrDirective
@@ -188,13 +209,29 @@ func (lim Limits) scan(data []byte) error {
 	return nil
 }
 
-// uniqueAttrs rejects an element that repeats an attribute's local name. xml.Unmarshal matches attributes by local
-// name in any namespace and the last one wins, so uid="a" and x:uid="b" on one element would quietly mean "b".
+// modelAttrs are the attributes the model decodes, by element. xml.Unmarshal matches an attribute by its local name
+// alone, in any namespace, including the xmlns prefix of a namespace declaration, so xmlns:uid="b" on <event> would
+// fill UID while a namespace-aware reader sees no uid attribute there at all.
+var modelAttrs = map[string]map[string]bool{
+	"event":   {"version": true, "uid": true, "type": true, "time": true, "start": true, "stale": true, "how": true},
+	"point":   {"lat": true, "lon": true, "hae": true, "ce": true, "le": true},
+	"contact": {"callsign": true},
+	"__group": {"name": true, "role": true},
+	"track":   {"course": true, "speed": true},
+}
+
+// uniqueAttrs rejects an element that repeats an attribute's local name, and, on an element the model decodes, any
+// namespaced attribute (a namespace declaration included) whose local name the model reads. Either way two parsers
+// could read different values: xml.Unmarshal keeps the last of uid="a" and x:uid="b", and takes xmlns:uid="b" for a uid.
 func uniqueAttrs(t xml.StartElement) error {
 	seen := make(map[string]bool, len(t.Attr))
 	for _, a := range t.Attr {
-		if a.Name.Space == "xmlns" || (a.Name.Space == "" && a.Name.Local == "xmlns") {
-			continue // namespace declarations, not data
+		if a.Name.Space == "" && a.Name.Local == "xmlns" {
+			continue // the default namespace declaration: not data, and no attribute shares its name
+		}
+		if a.Name.Space != "" && modelAttrs[t.Name.Local][a.Name.Local] {
+			return fmt.Errorf("%w: %s:%s on <%s> could be read as the CoT attribute %q", ErrDuplicateAttr,
+				a.Name.Space, a.Name.Local, t.Name.Local, a.Name.Local)
 		}
 		if seen[a.Name.Local] {
 			return fmt.Errorf("%w: %q on <%s>", ErrDuplicateAttr, a.Name.Local, t.Name.Local)
@@ -204,13 +241,13 @@ func uniqueAttrs(t xml.StartElement) error {
 	return nil
 }
 
-// requireAttrs checks that every named attribute is present. Presence has to be checked here, on the raw tokens,
-// because after decoding a missing lat looks exactly like lat="0".
+// requireAttrs checks that every named attribute is present, unnamespaced. Presence has to be checked here, on the raw
+// tokens, because after decoding a missing lat looks exactly like lat="0".
 func requireAttrs(t xml.StartElement, names []string) error {
 	for _, name := range names {
 		found := false
 		for _, a := range t.Attr {
-			if a.Name.Local == name {
+			if a.Name.Space == "" && a.Name.Local == name {
 				found = true
 				break
 			}
@@ -218,6 +255,30 @@ func requireAttrs(t xml.StartElement, names []string) error {
 		if !found {
 			return fmt.Errorf("%w: %q on <%s>", ErrMissing, name, t.Name.Local)
 		}
+	}
+	return nil
+}
+
+// xmlSpace is the whitespace XML allows outside the root element: space, tab, carriage return and line feed. Unicode
+// spaces such as a no-break space are not whitespace to XML, so text made of them is data.
+const xmlSpace = " \t\r\n"
+
+// IsXMLSpace reports whether b is empty or only XML whitespace.
+func IsXMLSpace(b []byte) bool {
+	return len(bytes.Trim(b, xmlSpace)) == 0
+}
+
+// minYear and maxYear bound the years a timestamp may name, in UTC: the four-digit years RFC 3339 can write. A time
+// outside them parses, but marshals to text no RFC 3339 parser accepts, so it couldn't be passed on.
+const (
+	minYear = 1
+	maxYear = 9999
+)
+
+// checkTime rejects a timestamp whose UTC year RFC 3339 can't write.
+func checkTime(name string, t Timestamp) error {
+	if y := time.Time(t).UTC().Year(); y < minYear || y > maxYear {
+		return fmt.Errorf("%w: %s is in the year %d, outside %d to %d", ErrInvalidField, name, y, minYear, maxYear)
 	}
 	return nil
 }
@@ -233,6 +294,14 @@ func (e Event) validate() error {
 	for _, f := range []struct{ name, value string }{{"type", e.Type}, {"how", e.How}} {
 		if len(f.value) > maxTypeLen || !typeGrammar.MatchString(f.value) {
 			return fmt.Errorf("%w: %s %q", ErrInvalidField, f.name, f.value)
+		}
+	}
+	for _, f := range []struct {
+		name string
+		t    Timestamp
+	}{{"time", e.Time}, {"start", e.Start}, {"stale", e.Stale}} {
+		if err := checkTime(f.name, f.t); err != nil {
+			return err
 		}
 	}
 	if time.Time(e.Stale).Before(time.Time(e.Start)) {

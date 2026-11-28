@@ -1,9 +1,9 @@
 // Package entity is a small, SDK-free model of the Lattice entity fields this project produces and checks.
 //
 // Field names and JSON tags follow the Lattice REST API, so an Entity marshals to the same JSON shape the API uses,
-// which is also what `takgw preflight` reads. Only the fields the gateway sets are modeled, and every field is a
-// pointer with omitempty, because a missing field and a zero value mean different things to the server. The official
-// SDK is used only at the edge: the publish adapter converts an Entity into the SDK's types.
+// which is also what `takgw preflight` reads. Only the fields the gateway sets are modeled. Every field is omitempty,
+// and every one that isn't a list is a pointer, because a missing field and a zero value mean different things to the
+// server. The official SDK is used only at the edge: the publish adapter converts an Entity into the SDK's types.
 package entity
 
 import "time"
@@ -128,9 +128,9 @@ type OperationalState string
 
 // The operational states the gateway reports for its input.
 const (
-	StateOperational    OperationalState = "OPERATIONAL_STATE_OPERATIONAL"
-	StateDegraded       OperationalState = "OPERATIONAL_STATE_DEGRADED"
-	StateNonOperational OperationalState = "OPERATIONAL_STATE_NON_OPERATIONAL"
+	SensorOperational    OperationalState = "OPERATIONAL_STATE_OPERATIONAL"
+	SensorDegraded       OperationalState = "OPERATIONAL_STATE_DEGRADED"
+	SensorNonOperational OperationalState = "OPERATIONAL_STATE_NON_OPERATIONAL"
 )
 
 // Sensors lists an asset's sensing capabilities.

@@ -9,12 +9,13 @@ import (
 	"maps"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"unicode"
 
 	lattice "github.com/anduril/lattice-sdk-go/v5"
+
+	"github.com/erikfailing/tak-interop-gateway/internal/jsonpath"
 )
 
 // Errors CheckJSON returns when it can't read a document. Each failure wraps ErrInvalidJSON, and a duplicate key also
@@ -32,34 +33,36 @@ var entityType = reflect.TypeFor[lattice.Entity]()
 
 // walker reads one JSON document token by token, following the matching SDK type alongside it.
 type walker struct {
-	dec     *json.Decoder
-	unknown []finding // keys the SDK doesn't declare, in document order
+	dec      *json.Decoder
+	unknown  []finding // keys the SDK doesn't declare, in document order
+	miscased []finding // keys that match a declared field only if case is ignored
 }
 
-// walkDocument checks that data is exactly one JSON object with no duplicate keys, and returns a finding for each key
-// the SDK's Entity type doesn't declare at that place. Duplicate keys are an error, not a finding: encoding/json keeps
-// the last copy and other decoders keep the first, so the checker and the server could read different entities.
-func walkDocument(data []byte) ([]finding, error) {
+// walkDocument checks that data is exactly one JSON object with no duplicate keys, and returns findings for the keys
+// the SDK's Entity type doesn't declare at that place: those it doesn't declare at all, and those that match a
+// declared field only if case is ignored. Duplicate keys are an error, not a finding: encoding/json keeps the last
+// copy and other decoders keep the first, so the checker and the server could read different entities.
+func walkDocument(data []byte) (unknown, miscased []finding, err error) {
 	// 1: The document must open with an object.
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber() // numbers are skipped, so there's no reason to convert them
 	w := &walker{dec: dec}
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, invalid(err)
+		return nil, nil, invalid(err)
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, fmt.Errorf("%w: the document is not a JSON object", ErrInvalidJSON)
+		return nil, nil, fmt.Errorf("%w: the document is not a JSON object", ErrInvalidJSON)
 	}
 
 	// 2: Walk it, then insist nothing follows.
 	if err := w.object("", entityType, 1); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: data after the entity object", ErrInvalidJSON)
+		return nil, nil, fmt.Errorf("%w: data after the entity object", ErrInvalidJSON)
 	}
-	return w.unknown, nil
+	return w.unknown, w.miscased, nil
 }
 
 // invalid wraps a decoder error.
@@ -112,7 +115,7 @@ func (w *walker) object(path string, t reflect.Type, depth int) error {
 			return invalid(err)
 		}
 		key := tok.(string) // the decoder only yields string keys inside an object
-		child := join(path, key)
+		child := jsonpath.Key(path, key)
 		dup := key
 		if isStruct {
 			dup = foldKey(key)
@@ -122,12 +125,18 @@ func (w *walker) object(path string, t reflect.Type, depth int) error {
 		}
 		seen[dup] = true
 
-		// 3: Find the member's type. An undeclared struct key is a finding, and its value is walked without a schema.
+		// 3: Find the member's type. A key that matches a field only if case is ignored is a finding of its own, and is
+		// walked as that field, since encoding/json will decode it as one. Any other undeclared key is a finding, and its
+		// value is walked without a schema.
 		var ct reflect.Type
 		switch {
 		case isStruct:
 			if ft, ok := fields[key]; ok {
 				ct = ft
+			} else if name, ok := caseMatch(key, fields); ok {
+				ct = fields[name]
+				w.miscased = append(w.miscased, finding{child, fmt.Sprintf("differs only in case from %q, the field's "+
+					"JSON name: encoding/json and the Go SDK read it as that field, but a case-sensitive reader drops it", name)})
 			} else {
 				w.unknown = append(w.unknown, finding{child, unknownDetail(t, key, fields)})
 			}
@@ -154,7 +163,7 @@ func (w *walker) array(path string, t reflect.Type, depth int) error {
 		elem = t.Elem()
 	}
 	for i := 0; w.dec.More(); i++ {
-		if err := w.value(fmt.Sprintf("%s[%d]", path, i), elem, depth); err != nil {
+		if err := w.value(jsonpath.Index(path, i), elem, depth); err != nil {
 			return err
 		}
 	}
@@ -164,17 +173,22 @@ func (w *walker) array(path string, t reflect.Type, depth int) error {
 	return nil
 }
 
-// unknownDetail explains an undeclared key, suggesting the declared field it most likely meant.
-func unknownDetail(t reflect.Type, key string, fields map[string]reflect.Type) string {
-	// 1: The commonest mistakes are the wrong case, which encoding/json and the Go SDK accept but the REST API's JSON
-	// names don't, and the snake_case names the Python SDK and the guide's examples use.
-	// The names are sorted so the suggestion is the same on every run.
-	names := slices.Sorted(maps.Keys(fields))
-	for _, name := range names {
+// caseMatch returns the declared field key matches when case is ignored, as encoding/json matches. The names are
+// sorted so the answer is the same on every run.
+func caseMatch(key string, fields map[string]reflect.Type) (string, bool) {
+	for _, name := range slices.Sorted(maps.Keys(fields)) {
 		if foldKey(name) == foldKey(key) {
-			return fmt.Sprintf("differs only in case from %q, the field's JSON name; encoding/json would accept it, but a case-sensitive reader would drop it", name)
+			return name, true
 		}
 	}
+	return "", false
+}
+
+// unknownDetail explains an undeclared key, suggesting the declared field it most likely meant.
+func unknownDetail(t reflect.Type, key string, fields map[string]reflect.Type) string {
+	// 1: The commonest mistake left, once case is ruled out, is a snake_case name, as the Python SDK and the guide's
+	// examples spell fields. The names are sorted so the suggestion is the same on every run.
+	names := slices.Sorted(maps.Keys(fields))
 	squashed := strings.ReplaceAll(foldKey(key), "_", "")
 	for _, name := range names {
 		if foldKey(name) == squashed {
@@ -230,36 +244,6 @@ func deref(t reflect.Type) reflect.Type {
 		t = t.Elem()
 	}
 	return t
-}
-
-// join appends key to a JSON path: dotted for a plain key (location.position), and quoted in brackets for any other,
-// such as an empty key or one containing a dot, so every path is non-empty and reads back unambiguously.
-func join(path, key string) string {
-	switch {
-	case !plainKey(key):
-		return path + "[" + strconv.Quote(key) + "]"
-	case path == "":
-		return key
-	}
-	return path + "." + key
-}
-
-// plainKey reports whether key is non-empty and only ASCII letters, digits and underscores, as every SDK field name is.
-func plainKey(key string) bool {
-	if key == "" {
-		return false
-	}
-	for i := range len(key) {
-		if !wordByte(key[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// wordByte reports whether b is an ASCII letter, digit or underscore.
-func wordByte(b byte) bool {
-	return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
 }
 
 // foldKey maps s to a canonical form shared by every string strings.EqualFold considers equal, so case-insensitive

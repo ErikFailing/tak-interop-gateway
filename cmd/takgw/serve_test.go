@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/erikfailing/tak-interop-gateway/internal/cotgen"
+	"github.com/erikfailing/tak-interop-gateway/internal/pipeline"
+	"github.com/erikfailing/tak-interop-gateway/internal/state"
 )
 
 // scenario returns ticks of cot-gen's default scenario (four walkers and the last-known-position marker), starting
@@ -81,6 +84,8 @@ func TestServeUsage(t *testing.T) {
 		{"negative max entities", []string{"-source", "s", "-stdin", "-max-entities", "-1"}, 2, "max entities must not be negative"},
 		{"no connections", []string{"-source", "s", "-listen", "127.0.0.1:0", "-max-conns", "0"}, 2, "-max-conns"},
 		{"no idle timeout", []string{"-source", "s", "-listen", "127.0.0.1:0", "-idle-timeout", "0s"}, 2, "-idle-timeout"},
+		{"connection limit without -listen", []string{"-source", "s", "-stdin", "-max-conns", "4"}, 2, "-max-conns needs -listen"},
+		{"idle timeout on stdin", []string{"-source", "s", "-stdin", "-idle-timeout", "1m"}, 2, "-idle-timeout needs -listen or -connect"},
 		{"stray argument", []string{"-source", "s", "-stdin", "extra"}, 2, "unexpected arguments"},
 		{"unknown flag", []string{"-bogus"}, 2, "flag provided but not defined"},
 		{"help", []string{"-h"}, 0, "usage: takgw serve"},
@@ -124,6 +129,69 @@ func TestServePublishFailureStops(t *testing.T) {
 	code := runServe(context.Background(), []string{"-source", "demo", "-stdin"}, strings.NewReader(scenario(t, 2)), failWriter{}, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "publish failed, stopping") || !strings.Contains(stderr.String(), "1 messages") {
 		t.Errorf("exit %d, stderr %q; want exit 1 after the first message", code, stderr.String())
+	}
+}
+
+// TestServeHealthPublishFailure checks that when the gateway's own asset can't be published at startup, serve stops
+// before reading any input, and never claims to have published the asset as offline.
+func TestServeHealthPublishFailure(t *testing.T) {
+	var stderr bytes.Buffer
+	code := runServe(context.Background(), []string{"-source", "demo", "-stdin", "-health-position", "40,-105"},
+		strings.NewReader(scenario(t, 1)), failWriter{}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "publish failed, stopping") || strings.Contains(stderr.String(), "as offline") {
+		t.Errorf("exit %d, stderr %q; want exit 1, a publish failure and no offline publish", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "messages:") {
+		t.Errorf("stderr = %q: serve read input after its first publish failed", stderr.String())
+	}
+}
+
+// TestGraceContext checks that publishes outlive a stop by the grace period, and no longer.
+func TestGraceContext(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	gctx, cancel := graceContext(ctx, 100*time.Millisecond)
+	defer cancel()
+	stop()
+	if gctx.Err() != nil {
+		t.Fatal("the grace context ended with the stop")
+	}
+	select {
+	case <-gctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the grace context outlived its grace period")
+	}
+
+	// cancel ends it at once, stop or no stop.
+	gctx, cancel = graceContext(context.Background(), time.Hour)
+	cancel()
+	if gctx.Err() == nil {
+		t.Error("cancel didn't end the grace context")
+	}
+}
+
+// TestSummary checks the summary line: every count, and the drops in a fixed order whatever order they happened in.
+func TestSummary(t *testing.T) {
+	c := counters{messages: 20, published: 9, unparsable: 1, unmappable: 2, rejected: 3, publishErrors: 1,
+		dropped: map[string]int{"origin-conflict": 1, "unchanged": 2, "repeated": 1}}
+	want := "20 messages: 9 published, 4 dropped (repeated 1, unchanged 2, origin-conflict 1), 1 unparsable, " +
+		"2 unmappable, 3 rejected by preflight, 1 publish errors, 4 stream errors; 7 entities tracked"
+	if got := c.summary(4, 7); got != want {
+		t.Errorf("summary =\n%s\nwant\n%s", got, want)
+	}
+	if got := (&counters{dropped: map[string]int{}}).drops(); got != "0 dropped" {
+		t.Errorf("drops = %q, want 0 dropped", got)
+	}
+}
+
+// TestDropReasons checks that every state-stage sentinel has a name, so none is counted as "other".
+func TestDropReasons(t *testing.T) {
+	for _, err := range []error{state.ErrRepeated, state.ErrOutOfOrder, state.ErrUnchanged, state.ErrFull,
+		state.ErrFutureTime, state.ErrImplausible, state.ErrOriginConflict} {
+		c := counters{dropped: map[string]int{}}
+		c.count(slog.New(slog.DiscardHandler), pipeline.Result{}, fmt.Errorf("%w: %w", pipeline.ErrDropped, err))
+		if c.dropped[otherDrop] != 0 {
+			t.Errorf("%v has no name in dropReasons", err)
+		}
 	}
 }
 
@@ -223,73 +291,4 @@ func TestServeListenInUse(t *testing.T) {
 	if code := runServe(context.Background(), []string{"-source", "demo", "-listen", taken.Addr().String()}, strings.NewReader(""), io.Discard, &stderr); code != 1 {
 		t.Errorf("exit %d, want 1\nstderr: %s", code, &stderr)
 	}
-}
-
-// startAcceptLoop runs an acceptLoop on a fresh loopback listener and returns its address and a function that stops
-// it and waits for it.
-func startAcceptLoop(t *testing.T, s *server) (string, func()) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	stopped := make(chan struct{})
-	go func() {
-		s.acceptLoop(ctx, ln)
-		close(stopped)
-	}()
-	return ln.Addr().String(), func() {
-		cancel()
-		<-stopped
-	}
-}
-
-// closedByServer reports whether the server closes conn within five seconds, without sending anything.
-func closedByServer(conn net.Conn) bool {
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err := conn.Read(make([]byte, 1))
-	return errors.Is(err, io.EOF)
-}
-
-// TestConnectionLimit checks that a connection beyond -max-conns is closed at once.
-func TestConnectionLimit(t *testing.T) {
-	frames := make(chan frame, 8)
-	s := &server{log: slog.New(slog.DiscardHandler), frames: frames, maxConns: 1, idleTimeout: time.Minute}
-	addr, stop := startAcceptLoop(t, s)
-	defer stop()
-	first, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer first.Close()
-	// Make sure the first connection holds the only slot before the second arrives.
-	if _, err := io.WriteString(first, scenario(t, 1)); err != nil {
-		t.Fatal(err)
-	}
-	<-frames
-	second, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Close()
-	if !closedByServer(second) {
-		t.Error("the connection over the limit was not closed")
-	}
-}
-
-// TestIdleTimeout checks that a connection that sends nothing is closed after -idle-timeout.
-func TestIdleTimeout(t *testing.T) {
-	s := &server{log: slog.New(slog.DiscardHandler), frames: make(chan frame, 8), maxConns: 4, idleTimeout: 100 * time.Millisecond}
-	addr, stop := startAcceptLoop(t, s)
-	defer stop()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if !closedByServer(conn) {
-		t.Error("the idle connection was not closed")
-	}
-	waitFor(t, "the timeout to count as a stream error", func() bool { return s.streamErrors() == 1 })
 }

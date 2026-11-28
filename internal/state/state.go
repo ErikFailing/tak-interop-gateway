@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"time"
 
@@ -33,6 +34,7 @@ var (
 	ErrFull           = errors.New("state: already tracking the maximum number of entities")
 	ErrImplausible    = errors.New("state: the report implies a speed nothing in its environment can reach")
 	ErrOriginConflict = errors.New("state: the entity is being published from another origin")
+	ErrFutureTime     = errors.New("state: the report is stamped further ahead of the gateway's clock than a clock should drift")
 	ErrConfig         = errors.New("state: invalid config")
 )
 
@@ -42,11 +44,18 @@ const (
 	DefaultRefresh = 30 * time.Second
 	// DefaultMaxEntities bounds the Tracker's memory: about 150 bytes per entity.
 	DefaultMaxEntities = 100_000
-	// DefaultOriginHold is how long an entity stays bound to its origin after that origin last published it. It is
-	// three refreshes, so a live but stationary unit, republished every refresh, keeps its binding, while a device
-	// that reconnects from a new address gets its track back after a short silence. An attacker can't squat a uid:
-	// the binding lasts only while they keep sending.
+	// DefaultOriginHold is how long an entity stays bound to its origin after that origin last published it, when
+	// change detection is off. With it on, the hold is three refreshes, so a live but stationary unit, republished
+	// every refresh, keeps its binding, while a device that reconnects from a new address gets its track back after a
+	// short silence. An attacker can't squat a uid: the binding lasts only while they keep sending.
 	DefaultOriginHold = 3 * DefaultRefresh
+	// DefaultMaxSkew is how far ahead of the gateway's clock a report may be stamped. TAK devices keep time by GPS or
+	// NTP, so five minutes is generous; a report stamped further ahead would, once published, make every later honest
+	// report look out of order.
+	DefaultMaxSkew = 5 * time.Minute
+	// maxUncertaintyCredit caps how much of a jump each report's uncertainty radius may excuse, in meters. Without a
+	// cap, a sender claiming to be uncertain by 20,000 km could move a track anywhere on Earth in a second.
+	maxUncertaintyCredit = 1000.0
 	// minInterval is the shortest time between two reports the speed check divides by, so two reports stamped a
 	// millisecond apart, with a meter of GPS jitter, don't look like a jet.
 	minInterval = time.Second
@@ -76,13 +85,21 @@ type Config struct {
 	Refresh time.Duration
 	// MaxEntities is how many entities the Tracker remembers at once. Zero means DefaultMaxEntities.
 	MaxEntities int
-	// OriginHold is how long an entity stays bound to its origin after its last publish. Zero means
-	// DefaultOriginHold; a negative value turns origin binding off.
+	// OriginHold is how long an entity stays bound to its origin after its last publish. Zero means three times the
+	// refresh, or DefaultOriginHold when change detection is off; a negative value turns origin binding off. A hold
+	// shorter than the refresh is refused: a stationary owner, republished only every refresh, would lose its binding
+	// in between.
 	OriginHold time.Duration
+	// MaxSkew is how far ahead of the gateway's clock a report may be stamped. Zero means DefaultMaxSkew; a negative
+	// value turns the check off.
+	MaxSkew time.Duration
 	// MaxSpeed sets the plausibility limit per environment, in meters per second; nil means DefaultMaxSpeed. An
-	// environment missing from the map, or with a limit of zero or less, has no limit.
+	// environment missing from the map, or with a limit of zero or less, has no limit. The Tracker keeps its own copy.
 	MaxSpeed map[entity.Environment]float64
 }
+
+// In Config, a negative Refresh, OriginHold or MaxSkew turns that behavior off, because zero already means "use the
+// default". A negative MaxEntities is an error: there is no sensible "off" for a memory bound.
 
 // Fix is a position report reduced to what the speed check needs.
 type Fix struct {
@@ -92,12 +109,13 @@ type Fix struct {
 
 // record is what the Tracker remembers about one entity's last publish.
 type record struct {
-	updated   time.Time // provenance.sourceUpdateTime
-	published time.Time // when the gateway published it, by the gateway's clock
-	expiry    time.Time // its expiryTime: the server forgets the entity then, so the Tracker can too
-	content   [32]byte  // a digest of everything but the time fields, for change detection
-	origin    string    // where it was published from
-	fix       Fix       // its position, when hasFix
+	updated   time.Time          // provenance.sourceUpdateTime
+	published time.Time          // when the gateway published it, by the gateway's clock
+	expiry    time.Time          // its expiryTime: the server forgets the entity then, so the Tracker can too
+	content   [32]byte           // a digest of everything but the time fields, for change detection
+	origin    string             // where it was published from
+	env       entity.Environment // its environment, for the speed limit
+	fix       Fix                // its position, when hasFix
 	hasFix    bool
 }
 
@@ -107,6 +125,7 @@ type Tracker struct {
 	refresh   time.Duration
 	max       int
 	hold      time.Duration
+	skew      time.Duration
 	maxSpeed  map[entity.Environment]float64
 	entities  map[string]record
 	lastSweep time.Time
@@ -117,19 +136,27 @@ func New(cfg Config) (*Tracker, error) {
 	if cfg.MaxEntities < 0 {
 		return nil, fmt.Errorf("%w: max entities must not be negative, got %d", ErrConfig, cfg.MaxEntities)
 	}
-	t := &Tracker{refresh: cfg.Refresh, max: cfg.MaxEntities, hold: cfg.OriginHold, maxSpeed: cfg.MaxSpeed,
-		entities: map[string]record{}}
+	t := &Tracker{refresh: cfg.Refresh, max: cfg.MaxEntities, hold: cfg.OriginHold, skew: cfg.MaxSkew,
+		maxSpeed: maps.Clone(cfg.MaxSpeed), entities: map[string]record{}}
 	if t.refresh == 0 {
 		t.refresh = DefaultRefresh
 	}
 	if t.max == 0 {
 		t.max = DefaultMaxEntities
 	}
-	if t.hold == 0 {
+	switch {
+	case t.hold == 0 && t.refresh > 0:
+		t.hold = 3 * t.refresh
+	case t.hold == 0:
 		t.hold = DefaultOriginHold
+	case t.hold > 0 && t.refresh > 0 && t.hold < t.refresh:
+		return nil, fmt.Errorf("%w: an origin hold of %s is shorter than the %s refresh", ErrConfig, t.hold, t.refresh)
+	}
+	if t.skew == 0 {
+		t.skew = DefaultMaxSkew
 	}
 	if t.maxSpeed == nil {
-		t.maxSpeed = DefaultMaxSpeed
+		t.maxSpeed = maps.Clone(DefaultMaxSpeed)
 	}
 	return t, nil
 }
@@ -140,16 +167,29 @@ func (t *Tracker) Len() int {
 }
 
 // Admit decides whether e, arriving from origin, should be published at now. It returns nil to publish, or an error
-// wrapping one of the sentinels above to hold the report back. Admit changes nothing; call Record once the entity has
-// actually been published, so a report that then fails preflight or publishing doesn't count as sent. An entity
+// wrapping one of the sentinels above to hold the report back. Admit records nothing about e (it only forgets entities
+// whose published copies have expired); call Record once the entity has actually been published, so a report that
+// then fails preflight or publishing doesn't count as sent. An entity
 // without an ID or a source update time is admitted, so preflight can reject it with the reason.
 func (t *Tracker) Admit(e entity.Entity, origin string, now time.Time) error {
-	// 1: An entity seen for the first time is admitted if there's room.
+	// 1: A report stamped well into the future would, once published, make every honest report after it look out of
+	// order, so it is refused before anything else.
 	id, updated, ok := key(e)
 	if !ok {
 		return nil
 	}
+	if t.skew > 0 && updated.After(now.Add(t.skew)) {
+		return fmt.Errorf("%w: stamped %s, %s ahead of the gateway's %s", ErrFutureTime,
+			updated.UTC().Format(time.RFC3339), updated.Sub(now).Round(time.Second), now.UTC().Format(time.RFC3339))
+	}
+
+	// 2: An entity seen for the first time is admitted if there's room. One whose published copy has expired is
+	// forgotten first: the server has forgotten it too, so its history shouldn't decide anything.
 	r, seen := t.entities[id]
+	if seen && !r.expiry.After(now) {
+		delete(t.entities, id)
+		seen = false
+	}
 	if !seen {
 		if len(t.entities) >= t.max {
 			t.sweep(now)
@@ -160,12 +200,8 @@ func (t *Tracker) Admit(e entity.Entity, origin string, now time.Time) error {
 		return nil
 	}
 
-	// 2: While its origin is still publishing it, nobody else may.
-	if t.hold > 0 && origin != r.origin && now.Sub(r.published) < t.hold {
-		return fmt.Errorf("%w: it is bound to %q until %s passes without a report from there", ErrOriginConflict, r.origin, t.hold)
-	}
-
-	// 3: A report must be newer than the last one published, or it is a rebroadcast or a late arrival.
+	// 3: A report must be newer than the last one published, or it is a rebroadcast or a late arrival. These go first,
+	// so a harmless rebroadcast relayed by another sender reads as a repeat, not as a claim on the track.
 	switch {
 	case updated.Equal(r.updated):
 		return ErrRepeated
@@ -173,10 +209,16 @@ func (t *Tracker) Admit(e entity.Entity, origin string, now time.Time) error {
 		return ErrOutOfOrder
 	}
 
-	// 4: The move since the last publish must be physically possible, judged by the source's own clock.
+	// 4: While its origin is still publishing it, nobody else may.
+	if t.hold > 0 && origin != r.origin && now.Sub(r.published) < t.hold {
+		return fmt.Errorf("%w: it is bound to %q until %s passes without a report from there", ErrOriginConflict, r.origin, t.hold)
+	}
+
+	// 5: The move since the last publish must be physically possible, judged by the source's own clock, under the
+	// stricter of the old and the new environment's limits, so retyping a ground unit as a satellite can't move it.
 	if f, ok := fixOf(e); ok && r.hasFix {
 		dt := updated.Sub(r.updated)
-		if limit := t.maxSpeed[environmentOf(e)]; limit > 0 {
+		if limit := t.limit(r.env, environmentOf(e)); limit > 0 {
 			if v := ImpliedSpeed(r.fix, f, dt); v > limit {
 				return fmt.Errorf("%w: moving %.0f m in %s means at least %.0f m/s, over the %.0f m/s limit for %s",
 					ErrImplausible, distance(r.fix, f), dt, v, limit, environmentOf(e))
@@ -184,7 +226,7 @@ func (t *Tracker) Admit(e entity.Entity, origin string, now time.Time) error {
 		}
 	}
 
-	// 5: A newer report that changes nothing waits for the refresh, unless the published copy would expire first.
+	// 6: A newer report that changes nothing waits for the refresh, unless the published copy would expire first.
 	if d, ok := digest(e); ok && t.refresh > 0 && d == r.content && now.Sub(r.published) < t.refresh && r.expiry.Sub(now) > t.refresh {
 		return ErrUnchanged
 	}
@@ -197,7 +239,7 @@ func (t *Tracker) Record(e entity.Entity, origin string, now time.Time) {
 	if !ok {
 		return
 	}
-	r := record{updated: updated, published: now, origin: origin}
+	r := record{updated: updated, published: now, origin: origin, env: environmentOf(e)}
 	r.content, _ = digest(e) // without a digest, the zero value matches no later report, so the next one publishes
 	r.fix, r.hasFix = fixOf(e)
 	if e.ExpiryTime != nil {
@@ -206,10 +248,23 @@ func (t *Tracker) Record(e entity.Entity, origin string, now time.Time) {
 	t.entities[id] = r
 }
 
+// limit returns the stricter of two environments' speed limits, or 0 when neither has one.
+func (t *Tracker) limit(a, b entity.Environment) float64 {
+	la, lb := t.maxSpeed[a], t.maxSpeed[b]
+	switch {
+	case la <= 0:
+		return lb
+	case lb <= 0:
+		return la
+	}
+	return min(la, lb)
+}
+
 // ImpliedSpeed is the slowest speed, in meters per second, that explains moving from a to b in dt: the great-circle
-// distance, less both reports' position uncertainty, divided by dt, with dt taken as at least one second.
+// distance, less both reports' position uncertainty (each capped at a kilometer), divided by dt, with dt taken as at
+// least one second.
 func ImpliedSpeed(a, b Fix, dt time.Duration) float64 {
-	d := max(0, distance(a, b)-a.CE-b.CE)
+	d := max(0, distance(a, b)-min(a.CE, maxUncertaintyCredit)-min(b.CE, maxUncertaintyCredit))
 	return d / max(dt, minInterval).Seconds()
 }
 

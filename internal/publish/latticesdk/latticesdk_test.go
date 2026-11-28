@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,7 +174,7 @@ func TestErrors(t *testing.T) {
 		{"missing Sandboxes token", latticesdk.Config{Token: testToken},
 			func(c *latticesdk.Client) error { return c.Publish(ctx, e) }, latticesdk.ErrUnauthorized},
 		{"entity without an ID", latticesdk.Config{Token: testToken, SandboxToken: testSandbox},
-			func(c *latticesdk.Client) error { return c.Publish(ctx, entity.Entity{IsLive: new(true)}) }, latticesdk.ErrRejected},
+			func(c *latticesdk.Client) error { return c.Publish(ctx, entity.Entity{IsLive: new(true)}) }, latticesdk.ErrBadRequest},
 		{"unknown entity", latticesdk.Config{Token: testToken, SandboxToken: testSandbox},
 			func(c *latticesdk.Client) error { _, err := c.Get(ctx, "no-such-entity"); return err }, latticesdk.ErrNotFound},
 	}
@@ -276,11 +277,89 @@ func TestNewChecksConfig(t *testing.T) {
 		{"both", latticesdk.Config{Endpoint: "abc.example.com", BaseURL: "https://abc.example.com", Token: "t"}, false},
 		{"neither", latticesdk.Config{Token: "t"}, false},
 		{"no token", latticesdk.Config{Endpoint: "abc.example.com"}, false},
+		{"base URL with a user and password", latticesdk.Config{BaseURL: "https://user:hunter2@abc.example.com", Token: "t"}, false},
+		{"base URL with a query", latticesdk.Config{BaseURL: "https://abc.example.com?x=1", Token: "t"}, false},
+		{"base URL with an empty query", latticesdk.Config{BaseURL: "https://abc.example.com?", Token: "t"}, false},
+		{"base URL with a fragment", latticesdk.Config{BaseURL: "https://abc.example.com#x", Token: "t"}, false},
 	}
 	for _, tt := range tests {
-		if _, err := latticesdk.New(tt.cfg); (err == nil) != tt.ok {
+		_, err := latticesdk.New(tt.cfg)
+		if (err == nil) != tt.ok {
 			t.Errorf("%s: err %v, want ok=%v", tt.name, err, tt.ok)
 		}
+		if err != nil && strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("%s: the error repeats the password: %v", tt.name, err)
+		}
+	}
+}
+
+// TestNoRedirects checks that the adapter never follows a redirect, which would carry both tokens to a host the
+// config never named, and that the caller's own HTTP client is left as it was.
+func TestNoRedirects(t *testing.T) {
+	var elsewhere atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		elsewhere.Add(1)
+		fmt.Fprint(w, `{}`)
+	}))
+	defer other.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	own := &http.Client{}
+	c, err := latticesdk.New(latticesdk.Config{BaseURL: srv.URL, Token: testToken, SandboxToken: testSandbox, HTTPClient: own})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(context.Background(), scenarioEntities(t)[0]); err == nil || !strings.Contains(err.Error(), "HTTP 307") {
+		t.Errorf("err = %v, want the 307 reported as an error", err)
+	}
+	if n := elsewhere.Load(); n != 0 {
+		t.Errorf("the redirect was followed: the other host got %d requests", n)
+	}
+	if own.CheckRedirect != nil {
+		t.Error("New changed the caller's HTTP client")
+	}
+}
+
+// TestStatusClassification checks that errors are classified by HTTP status, whatever the body: the SDK returns no
+// typed error for a body it can't decode, such as a proxy's HTML page, and a refused token must still read as one.
+func TestStatusClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		get         bool
+		want        error
+	}{
+		{"401 as an HTML page", http.StatusUnauthorized, "text/html", "<html>denied</html>", false, latticesdk.ErrUnauthorized},
+		{"401 as JSON", http.StatusUnauthorized, "application/json", `{"message":"no"}`, false, latticesdk.ErrUnauthorized},
+		{"403", http.StatusForbidden, "application/json", `{"message":"forbidden"}`, false, latticesdk.ErrUnauthorized},
+		{"400 as plain text", http.StatusBadRequest, "text/plain", "bad entity", false, latticesdk.ErrBadRequest},
+		{"404 as an HTML page", http.StatusNotFound, "text/html", "<html>gone</html>", true, latticesdk.ErrNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				fmt.Fprint(w, tt.body)
+			}))
+			defer srv.Close()
+			c, err := latticesdk.New(latticesdk.Config{BaseURL: srv.URL, Token: testToken})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.get {
+				_, err = c.Get(context.Background(), "some-id")
+			} else {
+				err = c.Publish(context.Background(), scenarioEntities(t)[0])
+			}
+			if !errors.Is(err, tt.want) {
+				t.Errorf("err = %v, want %v", err, tt.want)
+			}
+		})
 	}
 }
 

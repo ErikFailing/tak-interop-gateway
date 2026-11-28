@@ -9,6 +9,7 @@ import (
 	lattice "github.com/anduril/lattice-sdk-go/v5"
 
 	"github.com/erikfailing/tak-interop-gateway/entity"
+	"github.com/erikfailing/tak-interop-gateway/internal/jsonpath"
 )
 
 // SDKVersion is the lattice-sdk-go version the rules were checked against. The enum rule asks this SDK which values
@@ -75,10 +76,19 @@ var ruleKnownFields = Rule{
 	Sources:  []Source{srcEnumTrap, srcSDKTypes},
 }
 
-// rules is every rule in report order: errors, then warnings, then notes, each group roughly in the order a
-// publisher fills the fields.
+// ruleFieldNameCase is applied to the raw document by CheckJSON too: like known-fields, it needs the keys as written.
+var ruleFieldNameCase = Rule{
+	ID:       "field-name-case",
+	Severity: Error,
+	Summary:  "Every JSON key that names an SDK field is spelled in exactly the field's case. encoding/json and the Go SDK match keys case-insensitively, but the REST API's names are case-sensitive, so a key like EntityId is read here and dropped there, and the other rules can't vouch for it.",
+	Sources:  []Source{srcEnumTrap, srcSDKTypes},
+}
+
+// rules is every rule in report order: the two raw-document rules first, then the errors, warnings and notes the
+// model's rules find, each group roughly in the order a publisher fills the fields.
 var rules = []rule{
 	{ruleKnownFields, nil},
+	{ruleFieldNameCase, nil},
 	{Rule{
 		ID: "entity-id", Severity: Error,
 		Summary: "entityId is set and non-empty. It is the upsert key, so it must also be stable across republishes.",
@@ -330,11 +340,11 @@ func checkEnums(_ *Checker, e entity.Entity, _ time.Time) []finding {
 		}
 		for i, c := range h.Components {
 			if c.Health != nil {
-				out = append(out, checkEnum(fmt.Sprintf("health.components[%d].health", i), string(*c.Health), lattice.NewComponentHealthHealthFromString, lattice.ComponentHealthHealthHealthStatusInvalid)...)
+				out = append(out, checkEnum(jsonpath.Key(jsonpath.Index("health.components", i), "health"), string(*c.Health), lattice.NewComponentHealthHealthFromString, lattice.ComponentHealthHealthHealthStatusInvalid)...)
 			}
 			for j, m := range c.Messages {
 				if m.Status != nil {
-					out = append(out, checkEnum(fmt.Sprintf("health.components[%d].messages[%d].status", i, j), string(*m.Status), lattice.NewComponentMessageStatusFromString, lattice.ComponentMessageStatusHealthStatusInvalid)...)
+					out = append(out, checkEnum(jsonpath.Key(jsonpath.Index(jsonpath.Key(jsonpath.Index("health.components", i), "messages"), j), "status"), string(*m.Status), lattice.NewComponentMessageStatusFromString, lattice.ComponentMessageStatusHealthStatusInvalid)...)
 				}
 			}
 		}
@@ -342,10 +352,10 @@ func checkEnums(_ *Checker, e entity.Entity, _ time.Time) []finding {
 	if s := e.Sensors; s != nil {
 		for i, sensor := range s.Sensors {
 			if sensor.SensorType != nil {
-				out = append(out, checkEnum(fmt.Sprintf("sensors.sensors[%d].sensorType", i), string(*sensor.SensorType), lattice.NewSensorSensorTypeFromString, lattice.SensorSensorTypeSensorTypeInvalid)...)
+				out = append(out, checkEnum(jsonpath.Key(jsonpath.Index("sensors.sensors", i), "sensorType"), string(*sensor.SensorType), lattice.NewSensorSensorTypeFromString, lattice.SensorSensorTypeSensorTypeInvalid)...)
 			}
 			if sensor.OperationalState != nil {
-				out = append(out, checkEnum(fmt.Sprintf("sensors.sensors[%d].operationalState", i), string(*sensor.OperationalState), lattice.NewSensorOperationalStateFromString, lattice.SensorOperationalStateOperationalStateInvalid)...)
+				out = append(out, checkEnum(jsonpath.Key(jsonpath.Index("sensors.sensors", i), "operationalState"), string(*sensor.OperationalState), lattice.NewSensorOperationalStateFromString, lattice.SensorOperationalStateOperationalStateInvalid)...)
 			}
 		}
 	}

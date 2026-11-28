@@ -155,11 +155,25 @@ func TestFlags(t *testing.T) {
 		{"-tcp", "127.0.0.1:1", "-tls-cert", "c.pem"},
 		{"-intruder-cert", "i.pem", "-intruder-key", "i.key"},
 		{"-tcp", "127.0.0.1:1", "-intruder-cert", "i.pem", "-intruder-key", "i.key"},
+		{"-tcp", "127.0.0.1:1", "-tls-server-name", "gateway"},
+		{"-tcp", "127.0.0.1:1", "-tls-cert", "missing.pem", "-tls-key", "missing.key", "-tls-ca", "missing-ca.pem"},
 		{"-case", "no-such-case"},
 		{"extra"},
 	} {
 		if code := run(context.Background(), args, io.Discard, io.Discard); code != 2 {
 			t.Errorf("%v: exit %d, want 2", args, code)
 		}
+	}
+}
+
+// TestStopped checks that a stop before the last case is a failure, not a clean run: not every case was sent.
+func TestStopped(t *testing.T) {
+	var l listener
+	addr := l.serve(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stderr bytes.Buffer
+	if code := run(ctx, []string{"-tcp", addr, "-delay", "1ms"}, io.Discard, &stderr); code != 1 || !strings.Contains(stderr.String(), "stopped before") {
+		t.Errorf("exit %d, stderr %q; want 1 and a note that it stopped early", code, stderr.String())
 	}
 }

@@ -3,6 +3,7 @@ package cot
 import (
 	"encoding/xml"
 	"fmt"
+	"regexp"
 	"strconv"
 	"time"
 )
@@ -82,11 +83,19 @@ func (n Number) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
 	return xml.Attr{Name: name, Value: strconv.FormatFloat(float64(n), 'f', -1, 64)}, nil
 }
 
-// UnmarshalXMLAttr implements xml.UnmarshalerAttr.
+// decimal is the number syntax Number accepts: an optional sign, digits with an optional fraction, and an optional
+// exponent. strconv.ParseFloat alone would also take Go's own forms, such as hexadecimal (0x1p4), digit separators
+// (1_000), NaN and Inf, which other CoT readers reject or read differently.
+var decimal = regexp.MustCompile(`^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$`)
+
+// UnmarshalXMLAttr implements xml.UnmarshalerAttr. A value that isn't a plain decimal number is an invalid field.
 func (n *Number) UnmarshalXMLAttr(attr xml.Attr) error {
+	if !decimal.MatchString(attr.Value) {
+		return fmt.Errorf("%w: %s %q is not a decimal number", ErrInvalidField, attr.Name.Local, attr.Value)
+	}
 	v, err := strconv.ParseFloat(attr.Value, 64)
 	if err != nil {
-		return fmt.Errorf("attribute %s: %w", attr.Name.Local, err)
+		return fmt.Errorf("%w: %s %q: %w", ErrInvalidField, attr.Name.Local, attr.Value, err)
 	}
 	*n = Number(v)
 	return nil

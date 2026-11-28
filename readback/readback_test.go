@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,10 @@ func TestDiff(t *testing.T) {
 		{"array element added", `{"a":[1]}`, `{"a":[1,2]}`, []string{"added a[1]: 2"}},
 		{"odd key", `{"a.b":1}`, `{}`, []string{`dropped ["a.b"] (sent 1)`}},
 		{"null came back", `{"a":1}`, `{"a":null}`, []string{"changed a: sent 1, got null"}},
+		// Exactly, not as float64, which would call these equal and hide a platform rounding a large integer.
+		{"large integer rounded", `{"n":9007199254740993}`, `{"n":9007199254740992}`, []string{"changed n: sent 9007199254740993, got 9007199254740992"}},
+		{"same value past float64's range", `{"n":1e400}`, `{"n":10e399}`, nil},
+		{"same value, exponent and decimal", `{"n":1.5e3}`, `{"n":1500}`, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -139,6 +144,16 @@ func TestRun(t *testing.T) {
 		rs := readback.Run(ctx, &memory{}, []entity.Entity{{IsLive: new(true)}}, 0)
 		if rs[0].Passed() || rs[0].Err == nil {
 			t.Errorf("result = %+v", rs[0])
+		}
+	})
+	t.Run("two entities with one ID", func(t *testing.T) {
+		// The second publish would overwrite the first, which would then fail its comparison for no fault of the
+		// platform's, so the second is refused and the first is still checked.
+		second := sample("a")
+		second.Aliases.Name = new("UNIT-a-again")
+		rs := readback.Run(ctx, &memory{}, []entity.Entity{sample("a"), second}, 0)
+		if !rs[0].Passed() || rs[1].Passed() || rs[1].Err == nil || !strings.Contains(rs[1].Err.Error(), "same entityId") {
+			t.Errorf("results = %+v", rs)
 		}
 	})
 	t.Run("a cancelled context cuts the wait short", func(t *testing.T) {

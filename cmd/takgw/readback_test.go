@@ -156,7 +156,7 @@ func TestServeLattice(t *testing.T) {
 		useLive(t, rejectAll, "t", "")
 		var stderr bytes.Buffer
 		code := runServe(context.Background(), []string{"-source", "demo", "-stdin", "-lattice"}, strings.NewReader(scenario(t, 1)), nil, &stderr)
-		if code != 0 || !strings.Contains(stderr.String(), "5 publish errors") || !strings.Contains(stderr.String(), "rejected the entity") {
+		if code != 0 || !strings.Contains(stderr.String(), "5 publish errors") || !strings.Contains(stderr.String(), "rejected the request as invalid") {
 			t.Errorf("exit %d, stderr %q; want five logged rejections and a clean exit", code, stderr.String())
 		}
 	})

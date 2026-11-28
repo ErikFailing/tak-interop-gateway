@@ -79,7 +79,7 @@ func TestParseRejects(t *testing.T) {
 		{"too many elements", with(t, `<detail><contact callsign="SAR-1"/><track course="90" speed="1.4"/></detail>`, many), ErrTooManyElements},
 		// Structure.
 		{"empty input", ``, ErrNotEvent},
-		{"not XML", `hello`, ErrTrailingData},
+		{"not XML", `hello`, ErrStrayData},
 		{"unclosed element", strings.TrimSuffix(validEvent, `</event>`), ErrMalformed},
 		{"a DOCTYPE", `<!DOCTYPE event>` + validEvent, ErrDirective},
 		{"another processing instruction", `<?foo bar?>` + validEvent, ErrProcInst},
@@ -87,8 +87,8 @@ func TestParseRejects(t *testing.T) {
 		{"a non-UTF-8 encoding", `<?xml version="1.0" encoding="ISO-8859-1"?>` + validEvent, ErrMalformed},
 		{"wrong root", `<message uid="x"/>`, ErrNotEvent},
 		{"namespaced root", with(t, `<event `, `<event xmlns="urn:x" `), ErrNotEvent},
-		{"two events", validEvent + validEvent, ErrTrailingData},
-		{"text after the event", validEvent + "trailing", ErrTrailingData},
+		{"two events", validEvent + validEvent, ErrStrayData},
+		{"text after the event", validEvent + "trailing", ErrStrayData},
 		{"duplicate attribute", with(t, `uid="u-1"`, `uid="u-1" uid="u-2"`), ErrDuplicateAttr},
 		{"duplicate attribute in another namespace", with(t, `uid="u-1"`, `uid="u-1" xmlns:x="urn:x" x:uid="u-2"`), ErrDuplicateAttr},
 		{"two point elements", with(t, `<detail>`, `<point lat="1" lon="1" hae="0" ce="0" le="0"/><detail>`), ErrDuplicateElement},
@@ -111,8 +111,17 @@ func TestParseRejects(t *testing.T) {
 		{"stale before start", with(t, `stale="2026-11-27T16:02:00.000Z"`, `stale="2026-11-27T15:00:00.000Z"`), ErrInvalidField},
 		{"course out of range", with(t, `course="90"`, `course="400"`), ErrInvalidField},
 		{"negative speed", with(t, `speed="1.4"`, `speed="-1"`), ErrInvalidField},
-		{"unparseable number", with(t, `lat="40.3428"`, `lat="north"`), ErrMalformed},
+		{"unparseable number", with(t, `lat="40.3428"`, `lat="north"`), ErrInvalidField},
+		// Go reads these as numbers; CoT, an XML Schema decimal, doesn't, and another parser wouldn't either.
+		{"hexadecimal float", with(t, `lat="40.3428"`, `lat="0x1p-2"`), ErrInvalidField},
+		{"digit separators", with(t, `lat="40.3428"`, `lat="4_0.3428"`), ErrInvalidField},
 		{"unparseable time", with(t, `time="2026-11-27T16:00:00.000Z"`, `time="noon"`), ErrMalformed},
+		{"year zero", with(t, `time="2026-11-27T16:00:00.000Z"`, `time="0000-11-27T16:00:00.000Z"`), ErrInvalidField},
+		// encoding/xml matches attributes by local name in any namespace, xmlns: declarations included, so a namespaced
+		// attribute with a CoT attribute's name could be read as it: it is refused, with or without the real one.
+		{"namespace declaration named like a CoT attribute", with(t, `uid="u-1"`, `uid="u-1" xmlns:uid="urn:x"`), ErrDuplicateAttr},
+		{"namespaced attribute standing in for a missing one", with(t, ` lat="40.3428"`, ` xmlns:x="urn:x" x:lat="1"`), ErrDuplicateAttr},
+		{"namespaced attribute on a child element", with(t, `callsign="SAR-1"`, `callsign="SAR-1" xmlns:x="urn:x" x:callsign="EVIL"`), ErrDuplicateAttr},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,10 +133,40 @@ func TestParseRejects(t *testing.T) {
 	}
 }
 
-// TestLimitsAreConfigurable checks that a caller's tighter limits are the ones applied.
+// TestLimitsAreConfigurable checks that a caller's tighter limits are the ones applied, and that a limit left at zero
+// means its default rather than no limit at all.
 func TestLimitsAreConfigurable(t *testing.T) {
 	tight := Limits{MaxBytes: 100, MaxDepth: 32, MaxElements: 2048}
 	if _, err := tight.Parse([]byte(validEvent)); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("got %v, want ErrTooLarge", err)
+	}
+	if _, err := (Limits{MaxDepth: 2}).Parse([]byte(validEvent)); !errors.Is(err, ErrTooDeep) {
+		t.Errorf("only MaxDepth set: got %v, want ErrTooDeep", err)
+	}
+	if _, err := (Limits{}).Parse([]byte(validEvent)); err != nil {
+		t.Errorf("zero Limits: got %v, want the defaults", err)
+	}
+	huge := with(t, `<detail>`, `<detail><remarks>`+strings.Repeat("A", DefaultLimits.MaxBytes)+`</remarks>`)
+	if _, err := (Limits{MaxDepth: 32}).Parse([]byte(huge)); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("MaxBytes left at zero: got %v, want the default size limit", err)
+	}
+}
+
+// TestIsXMLSpace checks the whitespace XML itself allows between elements, which the framer skips: a vertical tab or
+// a no-break space isn't, so it is stray data a parser must refuse.
+func TestIsXMLSpace(t *testing.T) {
+	for in, want := range map[string]bool{"": true, " \t\r\n": true, "\n\n": true, "x": false, " x ": false, "\v": false, " ": false} {
+		if got := IsXMLSpace([]byte(in)); got != want {
+			t.Errorf("IsXMLSpace(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// TestForeignAttributesAllowed checks that a namespaced attribute the model doesn't read, the way TAK extensions
+// annotate elements, is still accepted.
+func TestForeignAttributesAllowed(t *testing.T) {
+	in := with(t, `uid="u-1"`, `uid="u-1" xmlns:x="urn:x" x:extension="1"`)
+	if _, err := Parse([]byte(in)); err != nil {
+		t.Errorf("Parse = %v, want an unread namespaced attribute accepted", err)
 	}
 }

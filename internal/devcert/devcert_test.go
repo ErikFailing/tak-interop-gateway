@@ -70,6 +70,28 @@ func TestGenerate(t *testing.T) {
 }
 
 // TestNoOverwrite checks that Generate refuses to replace any existing file, and writes nothing when it refuses.
+// TestFailedWriteCleansUp checks that a write failing partway removes the files already written, so the retry, which
+// refuses to overwrite anything, can succeed.
+func TestFailedWriteCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	restore := devcert.FailWritesAfter(3)
+	_, err := devcert.Generate(dir, []string{"localhost"}, time.Now())
+	restore()
+	if err == nil {
+		t.Fatal("Generate succeeded despite a failed write")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("the failed run left %v behind", names)
+	}
+	if _, err := devcert.Generate(dir, []string{"localhost"}, time.Now()); err != nil {
+		t.Errorf("the retry failed: %v", err)
+	}
+}
+
 func TestNoOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "client.key"), []byte("keep me"), 0o600); err != nil {

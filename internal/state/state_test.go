@@ -162,7 +162,7 @@ func moving(updated time.Time, lat, lon, ce float64, env entity.Environment) ent
 func TestImplausibleJump(t *testing.T) {
 	tests := []struct {
 		name string
-		to   entity.Entity // from (40, -105) at t0, with no uncertainty
+		to   entity.Entity // from (40, -105) at t0 in the same environment, with no uncertainty
 		want error
 	}{
 		{"walking pace", moving(t0.Add(10*time.Second), 40.0001, -105, 0, entity.EnvironmentLand), nil},
@@ -179,8 +179,9 @@ func TestImplausibleJump(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tr := newTracker(t, state.Config{})
-			tr.Record(moving(t0, 40, -105, 0, entity.EnvironmentLand), "", t0)
-			admit(t, tr, tt.to, t0.Add(time.Second), tt.want)
+			tr.Record(moving(t0, 40, -105, 0, *tt.to.MilView.Environment), "", t0)
+			at := *tt.to.Provenance.SourceUpdateTime // checked when it arrives, so it is never from the future
+			admit(t, tr, tt.to, at, tt.want)
 		})
 	}
 
@@ -198,16 +199,88 @@ func TestImplausibleJump(t *testing.T) {
 	admit(t, tr, moving(t0.Add(time.Second), 41, -105, 0, entity.EnvironmentLand), t0.Add(time.Second), nil)
 }
 
-// TestImpliedSpeed pins the arithmetic.
+// TestImpliedSpeed pins the arithmetic against distances worked out by hand on a sphere of the WGS84 mean radius:
+// a degree along the equator, a degree of longitude at 60 degrees north (half as far), a degree of latitude from the
+// pole, and two "different" points at the pole, which are the same point.
 func TestImpliedSpeed(t *testing.T) {
-	a, b := state.Fix{Lat: 0, Lon: 0}, state.Fix{Lat: 0, Lon: 1} // one degree of longitude on the equator: about 111.2 km
-	if v := state.ImpliedSpeed(a, b, 100*time.Second); math.Abs(v-1111.95) > 1 {
-		t.Errorf("ImpliedSpeed = %v m/s, want about 1111.95", v)
+	tests := []struct {
+		name string
+		a, b state.Fix
+		dt   time.Duration
+		want float64 // m/s
+	}{
+		{"along the equator", state.Fix{Lat: 0, Lon: 0}, state.Fix{Lat: 0, Lon: 1}, 100 * time.Second, 1111.95},
+		{"at 60 degrees north", state.Fix{Lat: 60, Lon: 0}, state.Fix{Lat: 60, Lon: 1}, 100 * time.Second, 555.97},
+		{"from the pole", state.Fix{Lat: 90, Lon: 0}, state.Fix{Lat: 89, Lon: 0}, 100 * time.Second, 1111.95},
+		{"around the pole", state.Fix{Lat: 90, Lon: 0}, state.Fix{Lat: 90, Lon: 180}, time.Second, 0},
+		{"uncertainty excuses part of it", state.Fix{Lat: 0, Lon: 0, CE: 500}, state.Fix{Lat: 0, Lon: 1, CE: 500}, 100 * time.Second, 1101.95},
+		// Each report's uncertainty excuses at most a kilometer, or a sender could claim enough to move anywhere.
+		{"uncertainty is capped", state.Fix{Lat: 0, Lon: 0, CE: 60_000}, state.Fix{Lat: 0, Lon: 1, CE: 60_000}, 100 * time.Second, 1091.95},
+		{"uncertainty covers a short step", state.Fix{Lat: 0, Lon: 0, CE: 600}, state.Fix{Lat: 0, Lon: 0.01, CE: 600}, time.Second, 0},
 	}
-	a.CE, b.CE = 60_000, 60_000
-	if v := state.ImpliedSpeed(a, b, time.Second); v != 0 {
-		t.Errorf("with the uncertainty covering the distance, ImpliedSpeed = %v, want 0", v)
+	for _, tt := range tests {
+		if v := state.ImpliedSpeed(tt.a, tt.b, tt.dt); math.Abs(v-tt.want) > 0.05 {
+			t.Errorf("%s: ImpliedSpeed = %.2f m/s, want %.2f", tt.name, v, tt.want)
+		}
 	}
+}
+
+// TestFutureTime checks that a report stamped further ahead than clocks drift is refused, even for a known entity, and
+// that it changes nothing: the honest report after it still gets through.
+func TestFutureTime(t *testing.T) {
+	tr := newTracker(t, state.Config{})
+	admit(t, tr, report("a", t0.Add(4*time.Minute), 40, t0.Add(10*time.Minute)), t0, nil) // within the skew
+	admit(t, tr, report("a", t0.Add(6*time.Minute), 40, t0.Add(10*time.Minute)), t0, state.ErrFutureTime)
+	tr.Record(report("a", t0, 40, t0.Add(2*time.Minute)), "", t0)
+	admit(t, tr, report("a", t0.Add(time.Hour), 40.1, t0.Add(2*time.Hour)), t0.Add(time.Second), state.ErrFutureTime)
+	admit(t, tr, report("a", t0.Add(time.Second), 40.0001, t0.Add(2*time.Minute)), t0.Add(time.Second), nil)
+
+	// A custom skew, and none.
+	tr = newTracker(t, state.Config{MaxSkew: time.Second})
+	admit(t, tr, report("a", t0.Add(2*time.Second), 40, t0.Add(time.Minute)), t0, state.ErrFutureTime)
+	tr = newTracker(t, state.Config{MaxSkew: -1})
+	admit(t, tr, report("a", t0.Add(time.Hour), 40, t0.Add(2*time.Hour)), t0, nil)
+}
+
+// TestExpiredRecordForgotten checks that once an entity's published copy has expired, its history no longer decides
+// anything: the server has forgotten the entity too.
+func TestExpiredRecordForgotten(t *testing.T) {
+	tr := newTracker(t, state.Config{})
+	tr.Record(report("a", t0, 40, t0.Add(time.Minute)), "unit-a", t0)
+	later := t0.Add(70 * time.Second)
+	// Older than the last publish, and from another origin within the hold, yet admitted: the record expired.
+	if err := tr.Admit(report("a", t0.Add(-time.Second), 41, later.Add(time.Minute)), "unit-b", later); err != nil {
+		t.Errorf("Admit after the expiry = %v, want nil", err)
+	}
+	if tr.Len() != 0 {
+		t.Errorf("Len = %d, want the expired record gone", tr.Len())
+	}
+}
+
+// TestRetypeCantEscapeTheLimit checks that the speed check uses the stricter of the old and new environment's limits:
+// a ground unit retyped as a satellite, which has no limit, still can't jump.
+func TestRetypeCantEscapeTheLimit(t *testing.T) {
+	tr := newTracker(t, state.Config{})
+	tr.Record(moving(t0, 40, -105, 0, entity.EnvironmentLand), "", t0)
+	admit(t, tr, moving(t0.Add(time.Second), 41, -105, 0, entity.EnvironmentSpace), t0.Add(time.Second), state.ErrImplausible)
+
+	// And the other way: a satellite retyped as a ground unit is held to the ground limit.
+	tr = newTracker(t, state.Config{})
+	tr.Record(moving(t0, 40, -105, 0, entity.EnvironmentSpace), "", t0)
+	admit(t, tr, moving(t0.Add(time.Second), 41, -105, 0, entity.EnvironmentLand), t0.Add(time.Second), state.ErrImplausible)
+
+	// Two space reports stay unlimited.
+	tr = newTracker(t, state.Config{})
+	tr.Record(moving(t0, 40, -105, 0, entity.EnvironmentSpace), "", t0)
+	admit(t, tr, moving(t0.Add(time.Second), 41, -105, 0, entity.EnvironmentSpace), t0.Add(time.Second), nil)
+}
+
+// TestHugeUncertaintyCantExcuseAJump checks the uncertainty cap end to end: claiming to be uncertain by 20,000 km
+// doesn't let a ground unit cross a continent in a second.
+func TestHugeUncertaintyCantExcuseAJump(t *testing.T) {
+	tr := newTracker(t, state.Config{})
+	tr.Record(moving(t0, 40, -105, 20_000_000, entity.EnvironmentLand), "", t0)
+	admit(t, tr, moving(t0.Add(time.Second), 40, -75, 20_000_000, entity.EnvironmentLand), t0.Add(time.Second), state.ErrImplausible)
 }
 
 // TestOriginBinding checks that while an entity's origin keeps publishing it, another origin can't, and that the
@@ -240,4 +313,19 @@ func TestConfig(t *testing.T) {
 	if _, err := state.New(state.Config{MaxEntities: -1}); !errors.Is(err, state.ErrConfig) {
 		t.Errorf("negative MaxEntities: err %v, want ErrConfig", err)
 	}
+	if _, err := state.New(state.Config{Refresh: time.Minute, OriginHold: 30 * time.Second}); !errors.Is(err, state.ErrConfig) {
+		t.Errorf("a hold shorter than the refresh: err %v, want ErrConfig", err)
+	}
+	for _, cfg := range []state.Config{{Refresh: -1}, {Refresh: -1, OriginHold: time.Second}, {OriginHold: -1}} {
+		if _, err := state.New(cfg); err != nil {
+			t.Errorf("%+v: %v", cfg, err)
+		}
+	}
+
+	// The Tracker keeps its own copy of the speed limits: changing the caller's map afterwards changes nothing.
+	limits := map[entity.Environment]float64{entity.EnvironmentLand: 5}
+	tr := newTracker(t, state.Config{MaxSpeed: limits})
+	limits[entity.EnvironmentLand] = 1e9
+	tr.Record(moving(t0, 40, -105, 0, entity.EnvironmentLand), "", t0)
+	admit(t, tr, moving(t0.Add(time.Second), 40.001, -105, 0, entity.EnvironmentLand), t0.Add(time.Second), state.ErrImplausible)
 }

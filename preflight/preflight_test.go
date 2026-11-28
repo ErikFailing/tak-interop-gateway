@@ -59,7 +59,7 @@ func asAsset(e *entity.Entity) {
 		}},
 	}
 	e.Sensors = &entity.Sensors{Sensors: []entity.Sensor{{
-		SensorID: new("cot-feed"), SensorType: new(entity.SensorTypeTransponder), OperationalState: new(entity.StateOperational),
+		SensorID: new("cot-feed"), SensorType: new(entity.SensorTypeTransponder), OperationalState: new(entity.SensorOperational),
 	}}}
 }
 
@@ -213,8 +213,8 @@ func TestRules(t *testing.T) {
 		}
 	}
 
-	// The stateful rules and known-fields have their own tests below.
-	for _, id := range []string{"known-fields", "source-update-time-changes", "source-update-time-increases"} {
+	// The stateful rules and the two that need the raw document have their own tests below.
+	for _, id := range []string{"known-fields", "field-name-case", "source-update-time-changes", "source-update-time-increases"} {
 		covered[id] = true
 	}
 	for _, r := range preflight.Rules() {
@@ -253,6 +253,67 @@ func TestSourceUpdateTime(t *testing.T) {
 	}
 }
 
+// TestRejectedUpdateIsNotRemembered checks that a Checker remembers an update's time only when the server would accept
+// the entity: a rejected update never happened, so a corrected copy with the same time is not a repeat.
+func TestRejectedUpdateIsNotRemembered(t *testing.T) {
+	c := preflight.NewChecker(fixedClock(checkTime))
+	broken := goodTrack()
+	broken.IsLive = new(false)
+	if !preflight.HasErrors(c.Check(broken)) {
+		t.Fatal("the broken entity passed")
+	}
+	if vs := c.Check(goodTrack()); vs != nil {
+		t.Errorf("the corrected copy, with the rejected one's time: %v, want no findings", vs)
+	}
+	if got := hits(c.Check(goodTrack())); !slices.Equal(got, []hit{{"source-update-time-changes", "provenance.sourceUpdateTime"}}) {
+		t.Errorf("a real repeat after an accepted update: %v", got)
+	}
+}
+
+// TestStatelessCheck checks preflight.Check: the same findings as a fresh Checker, and no history, so the same
+// entity twice is not a repeat. A nil clock means the real one.
+func TestStatelessCheck(t *testing.T) {
+	broken := goodTrack()
+	broken.Aliases = nil
+	want := hits(preflight.NewChecker(fixedClock(checkTime)).Check(broken))
+	if got := hits(preflight.Check(broken, checkTime)); !slices.Equal(got, want) || len(got) == 0 {
+		t.Errorf("Check = %v, want %v", got, want)
+	}
+	if vs := preflight.Check(goodTrack(), checkTime); vs != nil {
+		t.Errorf("the first check: %v", vs)
+	}
+	if vs := preflight.Check(goodTrack(), checkTime); vs != nil {
+		t.Errorf("the second check of the same update: %v, want no history", vs)
+	}
+	e := goodTrack()
+	e.ExpiryTime = new(time.Now().Add(time.Minute))
+	e.Provenance.SourceUpdateTime = new(time.Now())
+	if vs := preflight.NewChecker(nil).Check(e); preflight.HasErrors(vs) {
+		t.Errorf("with the real clock: %v", vs)
+	}
+}
+
+// TestRulesAreCopies checks that a caller can't change what the package reports by editing what Rules returns.
+func TestRulesAreCopies(t *testing.T) {
+	rs := preflight.Rules()
+	before := rs[0].Sources[0]
+	rs[0].Sources[0] = preflight.Source{Title: "tampered"}
+	rs[0].ID = "tampered"
+	if again := preflight.Rules(); again[0].Sources[0] != before || again[0].ID == "tampered" {
+		t.Error("editing Rules' result changed the package's rules")
+	}
+	broken := goodTrack()
+	broken.EntityID = nil
+	for _, v := range preflight.Check(broken, checkTime) {
+		v.Rule.Sources[0] = preflight.Source{Title: "tampered"}
+	}
+	for _, v := range preflight.Check(broken, checkTime) {
+		if v.Rule.Sources[0].Title == "tampered" {
+			t.Fatal("editing a violation's rule changed the package's rules")
+		}
+	}
+}
+
 // TestCheckJSON checks the rules that need the raw document, and that documents which can't be read unambiguously
 // are refused.
 func TestCheckJSON(t *testing.T) {
@@ -285,7 +346,10 @@ func TestCheckJSON(t *testing.T) {
 	}{
 		{"SDK field the model doesn't use", with("", `"description":"a test entity","createdTime":"2026-11-27T17:00:00Z"`), nil, ""},
 		{"misspelled top-level key", with("", `"isLiv":true`), []hit{{"known-fields", "isLiv"}}, "not a field of Entity"},
-		{"wrong case", with("entityId", `"EntityId":"x"`), []hit{{"known-fields", "EntityId"}}, `differs only in case from "entityId"`},
+		// A key that differs from a field's name only in case is read as that field by encoding/json and the SDK, but
+		// dropped by a case-sensitive reader, so it is its own error rather than an unknown field.
+		{"wrong case", with("entityId", `"EntityId":"x"`), []hit{{"field-name-case", "EntityId"}}, `differs only in case from "entityId"`},
+		{"wrong case, nested", with("aliases", `"aliases":{"Name":"x"}`), []hit{{"field-name-case", "aliases.Name"}}, "a case-sensitive reader drops it"},
 		{"snake case", with("isLive", `"is_live":true`), []hit{{"known-fields", "is_live"}, {"is-live", "isLive"}}, `spells this field "isLive"`},
 		{"nested unknown key", with("location", `"location":{"position":{"latitudeDegrees":1,"longitudeDegrees":2,"lat":1}}`), []hit{{"known-fields", "location.position.lat"}}, "not a field of Position"},
 		{"unknown key inside an array element", with("aliases", `"aliases":{"name":"x","alternateIds":[{"typo":"x"}]}`), []hit{{"known-fields", "aliases.alternateIds[0].typo"}}, ""},
@@ -330,6 +394,9 @@ func TestCheckJSONRefuses(t *testing.T) {
 		{"two documents", "{} {}", false},
 		{"trailing garbage", "{}x", false},
 		{"wrong type", `{"isLive":"yes"}`, false},
+		// description is a string in the SDK, and not a field of the model, so only the decode into the SDK's type sees
+		// it. (Not createdTime: the SDK reads a number in a date-time field as Unix seconds.)
+		{"wrong type on a field only the SDK has", `{"description":5}`, false},
 		{"syntax error", `{"entityId":}`, false},
 		{"too deep", `{"description":` + strings.Repeat("[", 70) + strings.Repeat("]", 70) + `}`, false},
 		{"duplicate key", `{"entityId":"a","entityId":"b"}`, true},

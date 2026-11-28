@@ -3,7 +3,10 @@ package preflight
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
+
+	lattice "github.com/anduril/lattice-sdk-go/v5"
 
 	"github.com/erikfailing/tak-interop-gateway/entity"
 )
@@ -69,13 +72,22 @@ type Checker struct {
 }
 
 // NewChecker returns a Checker that reads the current time from now, which tests and CI can fix for repeatable
-// results.
+// results; nil means time.Now.
 func NewChecker(now func() time.Time) *Checker {
+	if now == nil {
+		now = time.Now
+	}
 	return &Checker{now: now, last: map[string]time.Time{}}
 }
 
-// Check returns every rule the entity breaks, in rule order, or nil if it breaks none. The known-fields rule needs the
-// raw document, so only CheckJSON applies it.
+// Check checks one entity on its own, at now, with no history: the stateful source-update-time rules can't fire. It
+// is for a caller that keeps its own history, or checks one entity at a time.
+func Check(e entity.Entity, now time.Time) []Violation {
+	return NewChecker(func() time.Time { return now }).Check(e)
+}
+
+// Check returns every rule the entity breaks, in rule order, or nil if it breaks none. The rules that need the raw
+// document, known-fields and field-name-case, only CheckJSON applies.
 func (c *Checker) Check(e entity.Entity) []Violation {
 	// 1: Apply every rule against one reading of the clock, so the expiry rules agree with each other.
 	now := c.now()
@@ -85,49 +97,66 @@ func (c *Checker) Check(e entity.Entity) []Violation {
 			continue
 		}
 		for _, f := range r.check(c, e, now) {
-			out = append(out, Violation{Rule: r.Rule, Field: f.field, Detail: f.detail})
+			out = append(out, Violation{Rule: r.clone(), Field: f.field, Detail: f.detail})
 		}
 	}
 
-	// 2: Remember this update's time only after the rules ran, so the stateful rules compared it with the previous one.
-	if e.EntityID != nil && e.Provenance != nil && e.Provenance.SourceUpdateTime != nil {
+	// 2: Remember this update's time, after the rules ran so the stateful ones compared it with the previous one, and
+	// only for an entity the server would accept: one it rejects never happened, so a corrected copy with the same
+	// time is not a repeat.
+	if !HasErrors(out) && e.EntityID != nil && *e.EntityID != "" && e.Provenance != nil && e.Provenance.SourceUpdateTime != nil {
 		c.last[*e.EntityID] = *e.Provenance.SourceUpdateTime
 	}
 	return out
 }
 
 // CheckJSON checks one entity given as a JSON object in the REST API's shape, the form `takgw preflight` reads. It
-// applies every rule, including known-fields. It returns an error wrapping ErrInvalidJSON, and no violations, when the
-// document can't be read unambiguously: malformed JSON, anything but a single object, a duplicate key, or a value of
-// the wrong type for a field the model knows.
+// applies every rule, including known-fields and field-name-case. It returns an error wrapping ErrInvalidJSON, and no
+// violations, when the document can't be read unambiguously: malformed JSON, anything but a single object, a duplicate
+// key, or a value of the wrong type for any field the SDK declares.
 func (c *Checker) CheckJSON(data []byte) ([]Violation, error) {
 	// 1: Walk the raw document against the SDK's types. This rejects what can't be read unambiguously and notes keys the
 	// SDK doesn't declare, which encoding/json would otherwise drop without a word.
-	unknown, err := walkDocument(data)
+	unknown, miscased, err := walkDocument(data)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2: Decode into the model and apply the entity rules. The walk already proved the document is one well-formed
+	// 2: Decode into the SDK's own type, which knows every field's type, so a wrong type on a field the model doesn't
+	// carry is caught too; then into the model, for the rules. The walk already proved the document is one well-formed
 	// object, so a failure here is a type mismatch, such as a string where a number belongs.
+	var sdk lattice.Entity
+	if err := json.Unmarshal(data, &sdk); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidJSON, err)
+	}
 	var e entity.Entity
 	if err := json.Unmarshal(data, &e); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidJSON, err)
 	}
 	var out []Violation
 	for _, f := range unknown {
-		out = append(out, Violation{Rule: ruleKnownFields, Field: f.field, Detail: f.detail})
+		out = append(out, Violation{Rule: ruleKnownFields.clone(), Field: f.field, Detail: f.detail})
+	}
+	for _, f := range miscased {
+		out = append(out, Violation{Rule: ruleFieldNameCase.clone(), Field: f.field, Detail: f.detail})
 	}
 	return append(out, c.Check(e)...), nil
 }
 
-// Rules returns every rule, in the order Check and CheckJSON report them.
+// Rules returns every rule, in the order Check and CheckJSON report them. The slice and every rule in it are copies,
+// so a caller can't change what the package reports.
 func Rules() []Rule {
 	out := make([]Rule, len(rules))
 	for i, r := range rules {
-		out[i] = r.Rule
+		out[i] = r.clone()
 	}
 	return out
+}
+
+// clone copies a rule with its own Sources, which would otherwise share the package's backing array.
+func (r Rule) clone() Rule {
+	r.Sources = slices.Clone(r.Sources)
+	return r
 }
 
 // HasErrors reports whether any violation has Error severity.

@@ -30,10 +30,12 @@ import (
 	"github.com/erikfailing/tak-interop-gateway/entity"
 )
 
-// Errors the adapter returns. Each wraps the SDK's error, whose text is the server's response.
+// Errors the adapter returns. Each wraps the SDK's error, whose text is the server's response. They are decided by the
+// HTTP status alone, so a refusal is classified the same whatever body comes with it: an auth proxy in front of the
+// platform often answers 401 in plain text, which the SDK doesn't decode into its typed errors.
 var (
 	ErrConfig       = errors.New("latticesdk: invalid config")
-	ErrRejected     = errors.New("latticesdk: the server rejected the entity")
+	ErrBadRequest   = errors.New("latticesdk: the server rejected the request as invalid")
 	ErrUnauthorized = errors.New("latticesdk: the server refused the credentials")
 	ErrNotFound     = errors.New("latticesdk: no such entity")
 )
@@ -41,8 +43,12 @@ var (
 // SandboxHeader carries the Sandboxes token, in addition to the environment token, on every request.
 const SandboxHeader = "anduril-sandbox-authorization"
 
-// defaultTimeout bounds each HTTP request, so a stalled server can't hang the gateway.
+// defaultTimeout bounds each HTTP request the default client sends.
 const defaultTimeout = 30 * time.Second
+
+// callTimeout bounds one Publish or Get, the SDK's retry and its wait included, so one stalled call can hold up the
+// gateway's serial pipeline for at most this long, whatever HTTP client the caller supplied.
+const callTimeout = 45 * time.Second
 
 // hostname matches a DNS name, optionally with a port: what LATTICE_ENDPOINT must hold.
 var hostname = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
@@ -59,7 +65,8 @@ type Config struct {
 	// SandboxToken is the account's Sandboxes token (SANDBOXES_TOKEN), sent in SandboxHeader. Leave it empty outside
 	// Sandboxes.
 	SandboxToken string
-	// HTTPClient sends the requests; nil means one with a 30-second timeout.
+	// HTTPClient sends the requests; nil means one with a 30-second timeout. The adapter uses a copy that never follows
+	// redirects, so the caller's client is left as it was.
 	HTTPClient *http.Client
 }
 
@@ -111,10 +118,15 @@ func New(cfg Config) (*Client, error) {
 	// 2: The static token goes in the Authorization header on every request; set that way, it takes precedence over
 	// the SDK's OAuth client-credentials flow, which then never runs. The Sandboxes token rides along on the client
 	// itself, as Anduril's guide says, so it covers every request.
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultTimeout}
+	// A redirect would carry both tokens somewhere the config never named: net/http drops Authorization on a redirect
+	// to another host, but forwards the Sandboxes header everywhere, and sends both in cleartext if the redirect drops
+	// to plain http. So the adapter refuses to follow one, and reports the 3xx as an error instead.
+	httpClient := &http.Client{Timeout: defaultTimeout}
+	if cfg.HTTPClient != nil {
+		c := *cfg.HTTPClient
+		httpClient = &c
 	}
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	header := http.Header{}
 	if cfg.SandboxToken != "" {
 		header.Set(SandboxHeader, "Bearer "+cfg.SandboxToken)
@@ -143,8 +155,9 @@ func baseURL(cfg Config) (string, error) {
 		return "https://" + cfg.Endpoint, nil
 	}
 	u, err := url.Parse(cfg.BaseURL)
-	if err != nil || u.Host == "" || (u.Path != "" && u.Path != "/") {
-		return "", fmt.Errorf("%w: BaseURL %q is not a scheme and host", ErrConfig, cfg.BaseURL)
+	if err != nil || u.Host == "" || (u.Path != "" && u.Path != "/") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		// The URL itself isn't echoed: it could hold a password.
+		return "", fmt.Errorf("%w: BaseURL must be only a scheme and a host, with no path, user, query or fragment", ErrConfig)
 	}
 	switch u.Scheme {
 	case "https":
@@ -156,7 +169,7 @@ func baseURL(cfg Config) (string, error) {
 	default:
 		return "", fmt.Errorf("%w: BaseURL scheme must be https or http", ErrConfig)
 	}
-	return strings.TrimSuffix(cfg.BaseURL, "/"), nil
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // Publish sends one entity. It implements publish.Publisher.
@@ -165,6 +178,8 @@ func (c *Client) Publish(ctx context.Context, e entity.Entity) error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	if _, err := c.sdk.Entities.PublishEntity(ctx, sdkEntity); err != nil {
 		return classify("publish", err)
 	}
@@ -174,6 +189,8 @@ func (c *Client) Publish(ctx context.Context, e entity.Entity) error {
 // Get reads one entity back, as JSON in the REST API's shape. The JSON is the SDK's own encoding of what it decoded,
 // so it holds every field this SDK version knows, including ones the gateway never set, such as createdTime.
 func (c *Client) Get(ctx context.Context, id string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	got, err := c.sdk.Entities.GetEntity(ctx, &lattice.GetEntityRequest{EntityID: id})
 	if err != nil {
 		return nil, classify("get", err)
@@ -198,24 +215,21 @@ func ToSDK(e entity.Entity) (*lattice.Entity, error) {
 	return &out, nil
 }
 
-// classify wraps an SDK error with the adapter's sentinel for its status, so callers can decide what's fatal: a
-// refused credential will fail every request, a rejected entity only that one.
+// classify wraps an SDK error with the adapter's sentinel for its HTTP status, so callers can decide what's fatal:
+// refused credentials will fail every request, a bad request only that one. Every typed SDK error carries a
+// *core.APIError, and so does an error whose body the SDK couldn't decode, so the status is always found.
 func classify(op string, err error) error {
-	var (
-		bad          *lattice.BadRequestError
-		unauthorized *lattice.UnauthorizedError
-		notFound     *lattice.NotFoundError
-		apiErr       *core.APIError
-	)
-	switch {
-	case errors.As(err, &bad):
-		return fmt.Errorf("%w (%s): %w", ErrRejected, op, err)
-	case errors.As(err, &unauthorized):
-		return fmt.Errorf("%w (%s): %w", ErrUnauthorized, op, err)
-	case errors.As(err, &notFound):
-		return fmt.Errorf("%w (%s): %w", ErrNotFound, op, err)
-	case errors.As(err, &apiErr):
-		return fmt.Errorf("latticesdk: %s: HTTP %d: %w", op, apiErr.StatusCode, err)
+	var apiErr *core.APIError
+	if !errors.As(err, &apiErr) {
+		return fmt.Errorf("latticesdk: %s: %w", op, err) // no response at all: a network or TLS failure
 	}
-	return fmt.Errorf("latticesdk: %s: %w", op, err)
+	switch apiErr.StatusCode {
+	case http.StatusBadRequest:
+		return fmt.Errorf("%w (%s): %w", ErrBadRequest, op, err)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("%w (%s): %w", ErrUnauthorized, op, err)
+	case http.StatusNotFound:
+		return fmt.Errorf("%w (%s): %w", ErrNotFound, op, err)
+	}
+	return fmt.Errorf("latticesdk: %s: HTTP %d: %w", op, apiErr.StatusCode, err)
 }

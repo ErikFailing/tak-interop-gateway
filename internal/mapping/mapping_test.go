@@ -250,6 +250,18 @@ func TestExpiryClamp(t *testing.T) {
 	if want := now.Add(MaxExpiry); !got.ExpiryTime.Equal(want) {
 		t.Errorf("expiry = %v, want it clamped to %v", *got.ExpiryTime, want)
 	}
+
+	// A clock reading in a local zone, with a monotonic reading, still gives a plain UTC expiry, like every other time
+	// the mapper writes.
+	local := time.Now().In(time.FixedZone("UTC-7", -7*3600))
+	e.Time, e.Start = cot.Timestamp(local.UTC()), cot.Timestamp(local.UTC())
+	e.Stale = cot.Timestamp(local.UTC().Add(60 * 24 * time.Hour))
+	if got, err = Map(e, testConfig(), local); err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiryTime.Location() != time.UTC || *got.ExpiryTime != got.ExpiryTime.Round(0) {
+		t.Errorf("clamped expiry %v is not a plain UTC time", *got.ExpiryTime)
+	}
 }
 
 func TestOptionalFields(t *testing.T) {

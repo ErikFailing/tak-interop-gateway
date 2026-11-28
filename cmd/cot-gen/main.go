@@ -11,26 +11,24 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/erikfailing/tak-interop-gateway/internal/cli"
 	"github.com/erikfailing/tak-interop-gateway/internal/cotgen"
 	"github.com/erikfailing/tak-interop-gateway/internal/transport"
 )
 
 func main() {
-	// Cancel the context on Ctrl-C so a realtime stream stops cleanly between ticks.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// Cancel the context on Ctrl-C or SIGTERM, so a run stops cleanly; a second Ctrl-C ends it at once.
+	ctx, stop := cli.SignalContext()
 	defer stop()
 	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -49,15 +47,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	start := fs.String("start", "", "timestamp of the first tick in RFC 3339 (default: now)")
 	tcpAddr := fs.String("tcp", "", "send to this host:port over TCP instead of stdout")
 	realtime := fs.Bool("realtime", false, "wait -interval between ticks instead of writing them all at once")
-	tlsCert := fs.String("tls-cert", "", "with -tcp, connect with mutual TLS presenting this certificate, PEM")
-	tlsKey := fs.String("tls-key", "", "the private key for -tls-cert, PEM")
-	tlsCA := fs.String("tls-ca", "", "the authority, PEM, the server's certificate must be signed by")
-	tlsServerName := fs.String("tls-server-name", "", "the name the server's certificate must carry, if not the host dialed")
+	var tlsFlags cli.ClientTLS
+	tlsFlags.Register(fs, "tcp")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
+	}
+	if fs.NArg() > 0 {
+		return fail(stderr, 2, "unexpected arguments: %v", fs.Args())
 	}
 
 	// 1: Turn the flags into a scenario config, rejecting combinations that make no sense.
@@ -85,38 +84,24 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	// 2: Pick the destination. A TCP connection, plain or mutual TLS, gets the same newline-separated events as stdout.
-	tlsSet := 0
-	for _, f := range []string{*tlsCert, *tlsKey, *tlsCA} {
-		if f != "" {
-			tlsSet++
-		}
+	// Asking for TLS without -tcp, or for only part of it, is refused rather than quietly sent in the clear.
+	if err := tlsFlags.Check(*tcpAddr != ""); err != nil {
+		return fail(stderr, 2, "%v", err)
 	}
-	switch {
-	case tlsSet != 0 && tlsSet != 3:
-		return fail(stderr, 2, "-tls-cert, -tls-key and -tls-ca go together: give all three")
-	case (tlsSet == 3 || *tlsServerName != "") && *tcpAddr == "":
-		return fail(stderr, 2, "the -tls flags need -tcp")
+	tlsConfig, err := tlsFlags.Config()
+	if err != nil {
+		return fail(stderr, 2, "%v", err)
 	}
 	out := stdout
 	if *tcpAddr != "" {
-		var conn net.Conn
-		netDialer := &net.Dialer{Timeout: 5 * time.Second}
-		if tlsSet == 3 {
-			cfg, err := transport.ClientTLS(*tlsCert, *tlsKey, *tlsCA, *tlsServerName)
-			if err != nil {
-				return fail(stderr, 2, "%v", err)
-			}
-			conn, err = (&tls.Dialer{NetDialer: netDialer, Config: cfg}).DialContext(ctx, "tcp", *tcpAddr)
-			if err != nil {
-				return fail(stderr, 1, "connect: %v", err)
-			}
-		} else {
-			conn, err = netDialer.DialContext(ctx, "tcp", *tcpAddr)
-			if err != nil {
-				return fail(stderr, 1, "connect: %v", err)
-			}
+		conn, err := transport.Dial(ctx, *tcpAddr, tlsConfig, 5*time.Second)
+		if err != nil {
+			return fail(stderr, 1, "connect: %v", err)
 		}
 		defer conn.Close()
+		// A stop closes the connection, so a write blocked on a server that stopped reading returns at once.
+		stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stopClose()
 		out = conn
 	}
 	w := bufio.NewWriter(out)
@@ -129,10 +114,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		pace = ticker.C
 	}
 	for i := 0; *ticks == 0 || i < *ticks; i++ {
+		if ctx.Err() != nil {
+			return 0 // interrupted: a clean stop, not an error
+		}
 		if i > 0 && pace != nil {
 			select {
 			case <-ctx.Done():
-				return 0 // interrupted between ticks: a clean stop, not an error
+				return 0
 			case <-pace:
 			}
 		}
@@ -146,6 +134,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			_ = w.WriteByte('\n')
 		}
 		if err := w.Flush(); err != nil {
+			if ctx.Err() != nil {
+				return 0 // the stop closed the connection mid-write
+			}
 			return fail(stderr, 1, "write: %v", err)
 		}
 	}

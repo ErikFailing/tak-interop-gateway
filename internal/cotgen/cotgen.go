@@ -21,8 +21,11 @@ const (
 	metersPerDegreeLat = 111_320.0
 	// laneSpacing is the gap in meters between team members walking abreast.
 	laneSpacing = 20.0
-	// baseCourse is the direction the team sweeps, in degrees from true north.
+	// baseCourse is the direction the team first sweeps, in degrees from true north.
 	baseCourse = 0.0
+	// laneLength is how far, in meters, the team walks before turning back: a line search sweeps its lane and returns,
+	// so however long the scenario runs, no one gets further from the origin than a lane plus one tick's walk.
+	laneLength = 1000.0
 	// lkpDistance is how far north of the origin, in meters, the last known position marker sits.
 	lkpDistance = 300.0
 )
@@ -68,6 +71,8 @@ type member struct {
 	pos           LatLon
 	course        float64 // degrees from true north
 	speed         float64 // meters per second
+	heading       float64 // the lane direction, baseCourse or its reverse; course wanders a few degrees around it
+	walked        float64 // meters walked along the current lane
 }
 
 // Scenario holds the moving state between ticks. Create one with New and call Next once per tick.
@@ -97,6 +102,7 @@ func New(cfg Config) (*Scenario, error) {
 			callsign: fmt.Sprintf("SIM-SAR-%d", i+1),
 			pos:      offset(cfg.Origin, 90, float64(i)*laneSpacing), // each member one lane further east
 			course:   baseCourse,
+			heading:  baseCourse,
 			speed:    1.2 + 0.4*s.rng.Float64(), // a walking pace, 1.2 to 1.6 m/s
 		})
 	}
@@ -115,14 +121,20 @@ func (s *Scenario) Next() []cot.Event {
 	return events
 }
 
-// advance walks every member along its course for one interval, then picks a new course a few degrees either side
-// of the sweep direction, so the tracks wander like real walkers but the team stays abreast.
+// advance walks every member along its course for one interval, turns them back at the end of the lane, then picks a
+// new course a few degrees either side of the lane direction, so the tracks wander like real walkers but the team
+// stays abreast.
 func (s *Scenario) advance() {
 	dt := s.cfg.Interval.Seconds()
 	for i := range s.team {
 		m := &s.team[i]
-		m.pos = offset(m.pos, m.course, m.speed*dt)
-		m.course = normalize(baseCourse + s.rng.Float64()*10 - 5)
+		step := m.speed * dt
+		m.pos = offset(m.pos, m.course, step)
+		if m.walked += step; m.walked >= laneLength {
+			m.walked = 0
+			m.heading = normalize(m.heading + 180)
+		}
+		m.course = normalize(m.heading + s.rng.Float64()*10 - 5)
 	}
 	s.now = s.now.Add(s.cfg.Interval)
 }

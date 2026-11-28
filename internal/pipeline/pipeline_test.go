@@ -173,8 +173,8 @@ func TestRejectedByPreflight(t *testing.T) {
 		t.Errorf("published %d entities, want 0", n)
 	}
 	// A rejected report isn't recorded either, so a corrected one can follow.
-	if p.Tracked() != 0 {
-		t.Errorf("Tracked = %d, want 0", p.Tracked())
+	if p.NumTracked() != 0 {
+		t.Errorf("NumTracked = %d, want 0", p.NumTracked())
 	}
 }
 
@@ -186,7 +186,7 @@ func TestStageErrors(t *testing.T) {
 		stage error
 		cause error
 	}{
-		{"stray text", []byte("hello"), pipeline.ErrParse, cot.ErrTrailingData},
+		{"stray text", []byte("hello"), pipeline.ErrParse, cot.ErrStrayData},
 		{"malformed XML", []byte("<event"), pipeline.ErrParse, cot.ErrMalformed},
 		{"not an event", []byte(`<chat/>`), pipeline.ErrParse, cot.ErrNotEvent},
 		{"not an atom", message(t, "u-1", "b-m-p-s-p-i", start), pipeline.ErrMap, mapping.ErrNotAnAtom},

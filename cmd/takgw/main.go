@@ -13,7 +13,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
+
+	"github.com/erikfailing/tak-interop-gateway/internal/cli"
 )
 
 // usage is printed for help, for a missing command and for an unknown command.
@@ -29,10 +30,12 @@ Run "takgw <command> -h" for a command's flags.
 `
 
 func main() {
-	// Cancel the context on Ctrl-C, so serve stops cleanly and prints its summary.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	// Cancel the context on Ctrl-C or SIGTERM, so serve stops cleanly and prints its summary. A second signal ends the
+	// process at once.
+	ctx, stop := cli.SignalContext()
+	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 // run dispatches one subcommand and returns the process exit code. It takes its context and streams as parameters so

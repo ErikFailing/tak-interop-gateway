@@ -35,7 +35,7 @@ var fuzzState = state.Config{Refresh: 30 * time.Second, MaxEntities: 8}
 var (
 	parseCauses = []error{
 		cot.ErrTooLarge, cot.ErrTooDeep, cot.ErrTooManyElements, cot.ErrMalformed, cot.ErrDirective, cot.ErrProcInst,
-		cot.ErrNotEvent, cot.ErrTrailingData, cot.ErrDuplicateAttr, cot.ErrDuplicateElement, cot.ErrMissing,
+		cot.ErrNotEvent, cot.ErrStrayData, cot.ErrDuplicateAttr, cot.ErrDuplicateElement, cot.ErrMissing,
 		cot.ErrInvalidField,
 	}
 	mapCauses     = []error{mapping.ErrNotAnAtom, mapping.ErrUnsupported, mapping.ErrExpired}
@@ -43,7 +43,7 @@ var (
 	stageSentinel = []error{pipeline.ErrParse, pipeline.ErrMap, pipeline.ErrDropped, pipeline.ErrRejected, pipeline.ErrPublish}
 	dropReasons   = map[error]string{
 		state.ErrRepeated: "repeated", state.ErrOutOfOrder: "out of order", state.ErrUnchanged: "unchanged", state.ErrFull: "full",
-		state.ErrImplausible: "implausible", state.ErrOriginConflict: "origin conflict",
+		state.ErrImplausible: "implausible", state.ErrOriginConflict: "origin conflict", state.ErrFutureTime: "future time",
 	}
 )
 
@@ -56,9 +56,10 @@ var (
 //   - Preflight never rejects anything: the mapper never builds an entity the server would refuse, and the state
 //     stage removes repeats before preflight sees them.
 //   - Each report the mapper accepts is published or dropped exactly as an independent reference model of the state
-//     policy predicts, with the same reason. So published updates strictly increase per entity, no published move is
-//     faster than its environment allows, and nothing changed is ever suppressed. Every message comes from one
-//     origin, so the origin binding is covered by its unit tests instead.
+//     policy predicts, with the same reason. So published updates strictly increase per entity, nothing stamped
+//     too far ahead is published, no published move is faster than the stricter of its old and new environment
+//     allows, and nothing changed is ever suppressed. Every message comes from one origin, so the origin binding is
+//     covered by its unit tests instead.
 //   - Every refusal wraps exactly one stage sentinel, plus a sentinel of that stage's own.
 //   - The publisher received exactly the entities reported as published, in order.
 //   - Running the same stream through a fresh pipeline gives exactly the same outcomes.
@@ -66,8 +67,8 @@ var (
 // Run it with: go test -fuzz=FuzzPipeline ./internal/pipeline
 func FuzzPipeline(f *testing.F) {
 	// 1: Seeds: a scenario stream, a repeated report, an out-of-order pair, every affiliation (more uids than the
-	// entity limit), noise between messages, the mapper's less common branches, and an unchanged report whose
-	// published copy is about to expire.
+	// entity limit), noise between messages, the mapper's less common branches, an unchanged report whose published
+	// copy is about to expire, a jump, a jump retyped into space, and a report stamped an hour ahead.
 	s, err := cotgen.New(cotgen.Config{
 		Units: 2, Origin: cotgen.LatLon{Lat: 40.3428, Lon: -105.6836}, Start: start,
 		Interval: 5 * time.Second, Stale: 2 * time.Minute, Seed: 1,
@@ -89,6 +90,8 @@ func FuzzPipeline(f *testing.F) {
 		Stale: cot.Timestamp(start.Add(2 * time.Minute)),
 		Point: cot.Point{Lat: 40.5, Lon: -105.6836, HAE: cot.Unknown, CE: 10, LE: cot.Unknown},
 	}
+	toSpace := teleport
+	toSpace.Type = "a-f-P" // space has no limit of its own, so only the old environment's stops this
 	var affiliations []byte
 	for _, typ := range []string{"a-f-G", "a-h-A", "a-u-S", "a-n-U", "a-p-P", "a-a-F", "a-s-X", "a-j-Z", "a-k-G", "a-o", "a-x-G-UC"} {
 		affiliations = append(affiliations, message(f, "uid-"+typ, typ, start)...)
@@ -102,6 +105,8 @@ func FuzzPipeline(f *testing.F) {
 		branchSeeds(f),
 		expiringSeed(f),
 		slices.Concat(one, []byte("\n"), marshal(f, teleport)), // a ground unit 17 km away a second later
+		slices.Concat(one, []byte("\n"), marshal(f, toSpace)),
+		message(f, "u-future", "a-f-G-U-C", start.Add(time.Hour)),
 	} {
 		f.Add(seed)
 	}
@@ -167,8 +172,9 @@ func expiringSeed(f *testing.F) []byte {
 type published struct {
 	updated time.Time
 	expiry  time.Time
-	content string    // the entity's JSON with its two time fields cleared
-	fix     state.Fix // its position and uncertainty radius
+	content string             // the entity's JSON with its two time fields cleared
+	fix     state.Fix          // its position and uncertainty radius
+	env     entity.Environment // its environment
 }
 
 // model is an independent statement of the state stage's policy, for a fixed clock: nothing expires during a run,
@@ -182,6 +188,8 @@ func (m *model) expect(e entity.Entity) string {
 	r, seen := m.last[*e.EntityID]
 	updated := *e.Provenance.SourceUpdateTime
 	switch {
+	case updated.After(fuzzNow.Add(state.DefaultMaxSkew)):
+		return "future time"
 	case !seen && len(m.last) >= fuzzState.MaxEntities:
 		return "full"
 	case !seen:
@@ -209,11 +217,23 @@ func fixOf(e entity.Entity) state.Fix {
 	return f
 }
 
-// tooFast says whether moving from the last published fix to e's, over the source's own clock, beats the default
-// limit for e's environment. The distance arithmetic is the state package's; the decision is restated here.
+// tooFast says whether moving from the last published fix to e's, over the source's own clock, beats the stricter of
+// the default limits for the old and the new environment. The distance arithmetic is the state package's, pinned by
+// TestImpliedSpeed's known answers; the decision is restated here.
 func tooFast(r published, e entity.Entity, updated time.Time) bool {
-	limit := state.DefaultMaxSpeed[*e.MilView.Environment] // the mapper always sets the environment
+	limit := stricter(state.DefaultMaxSpeed[r.env], state.DefaultMaxSpeed[*e.MilView.Environment]) // the mapper always sets it
 	return limit > 0 && state.ImpliedSpeed(r.fix, fixOf(e), updated.Sub(r.updated)) > limit
+}
+
+// stricter returns the lower of two speed limits, ignoring one of zero or less, which means no limit.
+func stricter(a, b float64) float64 {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	}
+	return min(a, b)
 }
 
 // content is an entity's JSON with expiryTime and provenance.sourceUpdateTime cleared: what "unchanged" compares.
@@ -326,7 +346,7 @@ func outcome(t *testing.T, ref *model, clock func() time.Time, res pipeline.Resu
 	}
 	ref.last[*res.Entity.EntityID] = published{
 		updated: *res.Entity.Provenance.SourceUpdateTime, expiry: *res.Entity.ExpiryTime, content: content(res.Entity),
-		fix: fixOf(res.Entity),
+		fix: fixOf(res.Entity), env: *res.Entity.MilView.Environment,
 	}
 	return "published " + data
 }

@@ -1,11 +1,16 @@
 package transport
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"time"
 )
 
 // ErrTLSConfig wraps every problem building a TLS config: a missing file, a key that doesn't match its certificate,
@@ -56,12 +61,39 @@ func ClientTLS(certFile, keyFile, caFile, serverName string) (*tls.Config, error
 	}, nil
 }
 
+// Dial connects to addr, with TLS when cfg isn't nil, giving up after timeout. With TLS it returns once the handshake
+// is done, so a server that fails verification fails here.
+func Dial(ctx context.Context, addr string, cfg *tls.Config, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if cfg == nil {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	return (&tls.Dialer{Config: cfg}).DialContext(ctx, "tcp", addr)
+}
+
 // PeerName returns the common name of the certificate the other side presented, for logs, or "" if there was none.
 func PeerName(state tls.ConnectionState) string {
 	if len(state.PeerCertificates) == 0 {
 		return ""
 	}
 	return state.PeerCertificates[0].Subject.CommonName
+}
+
+// PeerIdentity returns a stable identity for the other side of a verified connection, for deciding who may update
+// which track: "cert:" and the certificate's common name, or, for a certificate with no common name (common with
+// certificates that name their subject only in a SAN), "cert-sha256:" and the certificate's SHA-256 fingerprint, so
+// two such clients never share an identity. It returns "" when the other side presented no certificate.
+func PeerIdentity(state tls.ConnectionState) string {
+	if len(state.PeerCertificates) == 0 {
+		return ""
+	}
+	leaf := state.PeerCertificates[0]
+	if leaf.Subject.CommonName != "" {
+		return "cert:" + leaf.Subject.CommonName
+	}
+	sum := sha256.Sum256(leaf.Raw)
+	return "cert-sha256:" + hex.EncodeToString(sum[:])
 }
 
 // loadKeyPair loads a certificate and its private key.

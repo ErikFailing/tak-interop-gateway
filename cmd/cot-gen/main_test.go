@@ -69,6 +69,7 @@ func TestBadArguments(t *testing.T) {
 		{"negative ticks", []string{"-ticks=-1"}},
 		{"forever without realtime", []string{"-ticks=0"}},
 		{"zero units", []string{"-units=0"}},
+		{"stray argument", []string{"-ticks=1", "extra"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -169,6 +170,38 @@ func TestTLSFlags(t *testing.T) {
 		if code := run(context.Background(), append([]string{"-ticks=1"}, args...), io.Discard, &stderr); code != 2 {
 			t.Errorf("%v: exit code %d, want 2 (stderr: %s)", args, code, stderr.String())
 		}
+	}
+}
+
+// TestStopIsClean checks that a stop ends a real-time run at once with status 0, the way Ctrl-C ends a demo, both
+// between ticks and mid-stream to a listener.
+func TestStopIsClean(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	start := time.Now()
+	if code := run(ctx, []string{"-ticks=0", "-realtime", "-interval=1h"}, io.Discard, io.Discard); code != 0 {
+		t.Errorf("stdout: exit code %d, want 0", code)
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Errorf("the stop took %v: it waited out the interval", waited)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			defer conn.Close()
+			_, _ = io.Copy(io.Discard, conn)
+		}
+	}()
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	var stderr bytes.Buffer
+	if code := run(ctx, []string{"-ticks=0", "-realtime", "-interval=1h", "-tcp=" + ln.Addr().String()}, io.Discard, &stderr); code != 0 {
+		t.Errorf("TCP: exit code %d, want 0 (stderr: %s)", code, stderr.String())
 	}
 }
 

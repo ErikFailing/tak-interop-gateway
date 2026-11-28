@@ -1,7 +1,7 @@
 // Package publish defines the Publisher the pipeline sends entities through, and the adapters behind it. They are
 // the only code that hands entities to the outside world: Memory keeps them for tests, JSONL writes them out for
-// offline runs (and for `takgw preflight` to check), and an SDK adapter in internal/publish/latticesdk will send them
-// to Lattice.
+// offline runs (and for `takgw preflight` to check), and the SDK adapter in internal/publish/latticesdk sends them to
+// Lattice.
 package publish
 
 import (
@@ -34,7 +34,8 @@ func (m *Memory) Publish(_ context.Context, e entity.Entity) error {
 	return nil
 }
 
-// Entities returns a copy of everything published so far, in order.
+// Entities returns everything published so far, in order. The slice is a copy, but the entities in it share their
+// pointer fields with what was published, so a caller must treat them as read-only.
 func (m *Memory) Entities() []entity.Entity {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -2,11 +2,12 @@ package transport
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/erikfailing/tak-interop-gateway/internal/cot"
 )
 
 // Errors returned by Framer.Next. All three end the stream: once one is returned, every later call returns it again,
@@ -25,8 +26,10 @@ var (
 // tokenizer with the parser also means the two can't disagree about where an element ends.
 //
 // Each frame is the exact bytes of one root element, plus anything that came before it since the previous frame
-// (whitespace, an XML declaration, comments). Non-whitespace text between root elements is returned as a frame of its
-// own, which cot.Parse rejects, so one bad message doesn't take the next good one down with it.
+// (whitespace, an XML declaration, comments). Stray text between root elements is returned as a frame of its own,
+// which cot.Parse rejects, so stray text doesn't take the next good message down with it. A directive (such as
+// DOCTYPE) or a processing instruction is different: XML makes it part of the prolog of the element that follows, so
+// it stays in that element's frame, and cot.Parse rejects the two together.
 //
 // Framer does no validation beyond what tokenizing needs. Every frame still has to go through cot.Parse.
 type Framer struct {
@@ -36,8 +39,14 @@ type Framer struct {
 	err   error // the first fatal error, returned forever after
 }
 
-// NewFramer reads from r and returns frames of at most maxBytes each.
+// DefaultMaxFrame is the frame size limit NewFramer uses when given none: the same 64 KiB cot.Parse accepts by default.
+const DefaultMaxFrame = 64 << 10
+
+// NewFramer reads from r and returns frames of at most maxBytes each; zero or less means DefaultMaxFrame.
 func NewFramer(r io.Reader, maxBytes int) *Framer {
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxFrame
+	}
 	rec := &recorder{r: bufio.NewReader(r), max: maxBytes}
 	// rec implements io.ByteReader, so the decoder reads it byte by byte with no buffering of its own, and every
 	// byte it consumes passes through rec. Strict stays on and CharsetReader stays nil, as in cot.Parse.
@@ -66,7 +75,7 @@ func (f *Framer) Next() ([]byte, error) {
 				return f.cut(), nil
 			}
 		case xml.CharData:
-			if depth == 0 && len(bytes.TrimSpace(t)) > 0 {
+			if depth == 0 && !cot.IsXMLSpace(t) {
 				return f.cut(), nil
 			}
 		}

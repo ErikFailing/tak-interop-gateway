@@ -32,9 +32,9 @@ type Files struct {
 }
 
 // Generate writes ca.pem, server.pem, server.key, client.pem, client.key, intruder.pem and intruder.key into dir, which
-// it creates if needed. The
-// server certificate is valid for hosts, each a DNS name or an IP address. Generate never overwrites a file: if any
-// already exists, it writes nothing and returns an error.
+// it creates if needed. The server certificate is valid for hosts, each a DNS name or an IP address. Generate never
+// overwrites a file: if any already exists, it writes nothing and returns an error, and if a write fails partway, it
+// removes the files it had written, so a retry starts clean.
 func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 	// 1: Check every target before writing any, so a refusal leaves the directory as it was.
 	f := Files{
@@ -54,7 +54,7 @@ func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 		return Files{}, err
 	}
 
-	// 2: The authority, then a server and a client certificate it signs.
+	// 2: The authority, then a server certificate and two client certificates it signs.
 	notBefore, notAfter := now.Add(-time.Hour), now.Add(Validity) // an hour of slack for a skewed clock
 	caKey, caDER, err := issue(&x509.Certificate{
 		Subject:               pkix.Name{CommonName: "takgw development CA (not for production)"},
@@ -109,6 +109,7 @@ func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 	}
 
 	// 3: Write them. Keys are readable by the owner only. O_EXCL keeps a file that appeared since step 1 safe.
+	var written []string
 	for _, w := range []struct {
 		path, kind string
 		value      any // a DER certificate, or a private key
@@ -122,9 +123,13 @@ func Generate(dir string, hosts []string, now time.Time) (Files, error) {
 		{f.IntruderCert, "CERTIFICATE", intruderDER, 0o644},
 		{f.IntruderKey, "PRIVATE KEY", intruderKey, 0o600},
 	} {
-		if err := writePEM(w.path, w.kind, w.value, w.mode); err != nil {
+		if err := write(w.path, w.kind, w.value, w.mode); err != nil {
+			for _, done := range written {
+				_ = os.Remove(done) // best effort: the write error is the one worth reporting
+			}
 			return Files{}, err
 		}
+		written = append(written, w.path)
 	}
 	return f, nil
 }
@@ -150,6 +155,9 @@ func issue(template, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*ec
 	}
 	return key, der, nil
 }
+
+// write is writePEM, as a variable so a test can make a write fail partway through Generate.
+var write = writePEM
 
 // writePEM writes one PEM block to a new file. A private key is passed as *ecdsa.PrivateKey and encoded as PKCS #8.
 func writePEM(path, kind string, v any, mode os.FileMode) error {

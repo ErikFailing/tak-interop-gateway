@@ -76,6 +76,9 @@ func runReadback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	case fs.NArg() > 0:
 		fmt.Fprintf(stderr, "takgw readback: unexpected arguments: %v\n", fs.Args())
 		return 2
+	case *source == "":
+		fmt.Fprintln(stderr, "takgw readback: -source must not be empty: it is part of every test entity's ID")
+		return 2
 	case *expiry < 10*time.Second || *expiry >= 30*24*time.Hour:
 		fmt.Fprintln(stderr, "takgw readback: -expiry must be at least 10s and under 30 days")
 		return 2
@@ -202,7 +205,7 @@ func testEntities(source string, now time.Time, expiry time.Duration) ([]entity.
 		if err != nil {
 			return nil, fmt.Errorf("test event %s: %w", ev.UID, err)
 		}
-		if vs := preflight.NewChecker(func() time.Time { return now }).Check(e); vs != nil {
+		if vs := preflight.Check(e, now); vs != nil {
 			return nil, fmt.Errorf("test event %s fails preflight: %v", ev.UID, vs)
 		}
 		out = append(out, e)

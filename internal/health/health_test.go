@@ -2,6 +2,7 @@ package health_test
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -50,23 +51,31 @@ func TestStatus(t *testing.T) {
 		message    string // a substring of the integrity or output message, when set
 	}{
 		{"quiet", health.Totals{}, up, entity.HealthHealthy,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.StateOperational, "no suspect input"},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.SensorOperational, "no suspect input"},
 		{"busy and clean", health.Totals{Messages: 400, Published: 390}, up, entity.HealthHealthy,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.StateOperational, "390 published"},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.SensorOperational, "390 published"},
 		{"one implausible jump", health.Totals{Messages: 400, Published: 390, Implausible: 1}, up, entity.HealthWarn,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.StateDegraded, "1 implausible jump"},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.SensorDegraded, "1 implausible jump"},
 		{"an origin conflict", health.Totals{Messages: 10, OriginConflicts: 2}, up, entity.HealthWarn,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.StateDegraded, "2 reports from another origin"},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.SensorDegraded, "2 reports from another origin"},
 		{"a few bad messages in a busy window", health.Totals{Messages: 400, Unparsable: 6}, up, entity.HealthHealthy,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.StateOperational, ""},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.SensorOperational, ""},
 		{"a spike of bad messages", health.Totals{Messages: 40, Unparsable: 4, Rejected: 1}, up, entity.HealthWarn,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.StateDegraded, "4 unparsable messages"},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.SensorDegraded, "4 unparsable messages"},
 		{"one bad message in a quiet window", health.Totals{Messages: 1, Unparsable: 1}, up, entity.HealthHealthy,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.StateOperational, ""},
-		{"publishes failing", health.Totals{Messages: 10, Published: 7, PublishErrors: 3}, up, entity.HealthFail,
-			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthFail}, entity.StateOperational, "3 of 10 publishes failed"},
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthHealthy}, entity.SensorOperational, ""},
+		{"some publishes failing", health.Totals{Messages: 10, Published: 7, PublishErrors: 3}, up, entity.HealthWarn,
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthWarn}, entity.SensorOperational, "3 of 10 publishes failed"},
+		{"every publish failing", health.Totals{Messages: 10, PublishErrors: 10}, up, entity.HealthFail,
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthHealthy, entity.HealthFail}, entity.SensorOperational, "10 of 10 publishes failed"},
+		{"a report from the future", health.Totals{Messages: 50, Published: 49, FutureTimes: 1}, up, entity.HealthWarn,
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.SensorDegraded, "1 report stamped too far in the future"},
+		{"a stream that ended on bad input", health.Totals{Messages: 50, Published: 50, SuspectStreams: 2}, up, entity.HealthWarn,
+			[]entity.HealthStatus{entity.HealthHealthy, entity.HealthWarn, entity.HealthHealthy}, entity.SensorDegraded, "2 connections ended by unreadable input"},
 		{"input down", health.Totals{}, health.Input{Detail: "not connected"}, entity.HealthFail,
-			[]entity.HealthStatus{entity.HealthFail, entity.HealthHealthy, entity.HealthHealthy}, entity.StateNonOperational, ""},
+			[]entity.HealthStatus{entity.HealthFail, entity.HealthHealthy, entity.HealthHealthy}, entity.SensorNonOperational, ""},
+		{"input still connecting", health.Totals{}, health.Input{Starting: true, Detail: "connecting"}, entity.HealthWarn,
+			[]entity.HealthStatus{entity.HealthWarn, entity.HealthHealthy, entity.HealthHealthy}, entity.SensorDegraded, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -164,6 +173,7 @@ func TestConfig(t *testing.T) {
 		"no interval":           {Source: "s", Latitude: 1, Longitude: 1},
 		"interval over 30s":     {Source: "s", Latitude: 1, Longitude: 1, Interval: time.Minute},
 		"latitude out of range": {Source: "s", Latitude: 91, Longitude: 1, Interval: time.Second},
+		"altitude not finite":   {Source: "s", Latitude: 1, Longitude: 1, Interval: time.Second, Altitude: new(math.Inf(1))},
 	} {
 		if _, err := health.New(c); err == nil {
 			t.Errorf("%s: accepted", name)

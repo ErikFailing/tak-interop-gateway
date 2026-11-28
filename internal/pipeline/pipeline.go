@@ -33,7 +33,7 @@ var (
 // Config assembles a pipeline for one feed.
 type Config struct {
 	Mapping   mapping.Config
-	Limits    cot.Limits // the parser's limits; the zero value means cot.DefaultLimits
+	Limits    cot.Limits // the parser's limits; a field left at zero means its value in cot.DefaultLimits
 	State     state.Config
 	Publisher publish.Publisher
 	Clock     func() time.Time // read once per message; nil means time.Now
@@ -74,17 +74,14 @@ func New(cfg Config) (*Pipeline, error) {
 		return nil, err
 	}
 	p := &Pipeline{mapping: cfg.Mapping, limits: cfg.Limits, clock: cfg.Clock, state: tracker, pub: cfg.Publisher}
-	if p.limits == (cot.Limits{}) {
-		p.limits = cot.DefaultLimits
-	}
 	if p.clock == nil {
 		p.clock = time.Now
 	}
 	return p, nil
 }
 
-// Tracked returns how many entities the state stage currently remembers.
-func (p *Pipeline) Tracked() int {
+// NumTracked returns how many entities the state stage currently remembers.
+func (p *Pipeline) NumTracked() int {
 	return p.state.Len()
 }
 
@@ -108,8 +105,8 @@ func (p *Pipeline) Process(ctx context.Context, msg []byte, origin string) (Resu
 	}
 	res := Result{Entity: e}
 
-	// 3: Let the state stage drop repeats, late arrivals, unchanged reports, implausible jumps and other origins'
-	// claims before anything is checked or sent.
+	// 3: Let the state stage drop repeats, late arrivals, unchanged reports, reports from the future, implausible jumps
+	// and other origins' claims before anything is checked or sent.
 	if err := p.state.Admit(e, origin, at); err != nil {
 		return res, fmt.Errorf("%w: %w", ErrDropped, err)
 	}
@@ -118,7 +115,7 @@ func (p *Pipeline) Process(ctx context.Context, msg []byte, origin string) (Resu
 	// runs here without history, on a fresh Checker: a Checker's own memory would count a report whose publish failed
 	// as sent. An error-severity violation means the server would reject the entity, so it goes no further; warnings
 	// and notes travel with the result.
-	res.Violations = preflight.NewChecker(func() time.Time { return at }).Check(e)
+	res.Violations = preflight.Check(e, at)
 	for _, v := range res.Violations {
 		if v.Rule.Severity == preflight.Error {
 			return res, fmt.Errorf("%w: %s", ErrRejected, v)

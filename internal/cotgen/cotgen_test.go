@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/erikfailing/tak-interop-gateway/internal/cot"
 )
 
 // testConfig is a valid config with a fixed start time, so tests are deterministic.
@@ -156,6 +158,27 @@ func TestMovement(t *testing.T) {
 		want := float64(b.Detail.Track.Speed) * cfg.Interval.Seconds()
 		if math.Abs(moved-want) > 0.01*want {
 			t.Errorf("%s moved %.2f m, want about %.2f m", b.UID, moved, want)
+		}
+	}
+}
+
+// TestStaysInTheSearchArea checks that the walkers sweep their lanes back and forth rather than walking off for good:
+// after a long run (about 13 km of walking each) every one is still within the 1 km lane of where it started, plus a
+// little for the course's wander.
+func TestStaysInTheSearchArea(t *testing.T) {
+	s, err := New(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := s.Next()
+	var last []cot.Event
+	for range 2000 {
+		last = s.Next()
+	}
+	for i := range first {
+		d := haversine(float64(first[i].Point.Lat), float64(first[i].Point.Lon), float64(last[i].Point.Lat), float64(last[i].Point.Lon))
+		if d > 1.2*laneLength {
+			t.Errorf("%s is %.0f m from where it started, past its %.0f m lane", first[i].UID, d, laneLength)
 		}
 	}
 }

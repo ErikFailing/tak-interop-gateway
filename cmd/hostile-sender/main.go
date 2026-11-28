@@ -22,38 +22,41 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"slices"
 	"time"
 
+	"github.com/erikfailing/tak-interop-gateway/internal/cli"
 	"github.com/erikfailing/tak-interop-gateway/internal/hostile"
 	"github.com/erikfailing/tak-interop-gateway/internal/transport"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	ctx, stop := cli.SignalContext()
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
+
+// dialTimeout bounds each connection to the gateway, TLS handshake included.
+const dialTimeout = 5 * time.Second
 
 // options are the parsed flags.
 type options struct {
-	tcp, cert, key, ca, serverName, intruderCert, intruderKey string
-	delay                                                     time.Duration
+	tcp                       string
+	tls                       cli.ClientTLS
+	intruderCert, intruderKey string
+	delay                     time.Duration
 }
 
 // run parses the flags and sends the cases, returning the exit status: 0 when every case was sent, 1 when a
-// connection failed, 2 for bad arguments.
+// connection failed or the run was stopped before the end, 2 for bad arguments.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// 1: Parse the flags.
 	fs := flag.NewFlagSet("hostile-sender", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.tcp, "tcp", "", "send to this host:port, one connection per case, instead of stdout")
-	fs.StringVar(&o.cert, "tls-cert", "", "with -tcp, connect with mutual TLS presenting this certificate, PEM")
-	fs.StringVar(&o.key, "tls-key", "", "the private key for -tls-cert, PEM")
-	fs.StringVar(&o.ca, "tls-ca", "", "the authority, PEM, the gateway's certificate must be signed by")
-	fs.StringVar(&o.serverName, "tls-server-name", "", "the name the gateway's certificate must carry, if not the host dialed")
+	o.tls.Register(fs, "tcp")
 	fs.StringVar(&o.intruderCert, "intruder-cert", "", "a second client certificate, for the impersonation case's attack")
 	fs.StringVar(&o.intruderKey, "intruder-key", "", "the private key for -intruder-cert")
 	fs.DurationVar(&o.delay, "delay", 300*time.Millisecond, "with -tcp, the pause between cases, and between a case's setup and its attack")
@@ -65,20 +68,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	tlsSet := (o.cert != "") || (o.key != "") || (o.ca != "")
-	switch {
-	case fs.NArg() > 0:
-		fmt.Fprintf(stderr, "hostile-sender: unexpected arguments: %v\n", fs.Args())
+	usage := func(format string, a ...any) int {
+		fmt.Fprintf(stderr, "hostile-sender: "+format+"\n", a...)
 		return 2
-	case tlsSet && (o.cert == "" || o.key == "" || o.ca == ""):
-		fmt.Fprintln(stderr, "hostile-sender: -tls-cert, -tls-key and -tls-ca go together")
-		return 2
-	case (tlsSet || o.intruderCert != "" || o.intruderKey != "") && o.tcp == "":
-		fmt.Fprintln(stderr, "hostile-sender: the TLS flags need -tcp")
-		return 2
-	case (o.intruderCert == "") != (o.intruderKey == "") || (o.intruderCert != "" && !tlsSet):
-		fmt.Fprintln(stderr, "hostile-sender: -intruder-cert and -intruder-key go together, with the -tls flags")
-		return 2
+	}
+	if fs.NArg() > 0 {
+		return usage("unexpected arguments: %v", fs.Args())
+	}
+	if err := o.tls.Check(o.tcp != ""); err != nil {
+		return usage("%v", err)
+	}
+	if (o.intruderCert == "") != (o.intruderKey == "") || (o.intruderCert != "" && !o.tls.Enabled()) {
+		return usage("-intruder-cert and -intruder-key go together, with -tcp and the -tls flags")
 	}
 
 	// 2: Pick the cases.
@@ -92,17 +93,27 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if *only != "" {
 		c, err := hostile.Find(cases, *only)
 		if err != nil {
-			fmt.Fprintf(stderr, "hostile-sender: %v (-list shows them)\n", err)
-			return 2
+			return usage("%v (-list shows them)", err)
 		}
 		cases = []hostile.Case{c}
 	}
 
-	// 3: Send them.
+	// 3: Load the certificates, and send.
 	if o.tcp == "" {
 		return toStdout(cases, stdout, stderr)
 	}
-	return toTCP(ctx, cases, o, stderr)
+	client, err := o.tls.Config()
+	if err != nil {
+		return usage("%v", err)
+	}
+	var intruder *tls.Config
+	if o.intruderCert != "" {
+		id := cli.ClientTLS{Cert: o.intruderCert, Key: o.intruderKey, CA: o.tls.CA, ServerName: o.tls.ServerName}
+		if intruder, err = id.Config(); err != nil {
+			return usage("intruder: %v", err)
+		}
+	}
+	return toTCP(ctx, cases, o, client, intruder, stderr)
 }
 
 // toStdout writes every case one stream can carry, as one stream: the stream-ending cases would cut off the rest,
@@ -122,21 +133,10 @@ func toStdout(cases []hostile.Case, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// toTCP sends each case on its own connection. The impersonation case sends its setup on one identity's connection
-// and, while that stays open, its attack on the intruder's.
-func toTCP(ctx context.Context, cases []hostile.Case, o options, stderr io.Writer) int {
-	// 1: How to connect as each identity.
-	dial := func(cert, key string) (net.Conn, error) {
-		d := &net.Dialer{Timeout: 5 * time.Second}
-		if cert == "" {
-			return d.DialContext(ctx, "tcp", o.tcp)
-		}
-		cfg, err := transport.ClientTLS(cert, key, o.ca, o.serverName)
-		if err != nil {
-			return nil, err
-		}
-		return (&tls.Dialer{NetDialer: d, Config: cfg}).DialContext(ctx, "tcp", o.tcp)
-	}
+// toTCP sends each case on its own connection, as the client identity (or over plain TCP when client is nil). The
+// impersonation case sends its setup on the client's connection and, while that stays open, its attack on the
+// intruder's.
+func toTCP(ctx context.Context, cases []hostile.Case, o options, client, intruder *tls.Config, stderr io.Writer) int {
 	send := func(conn net.Conn, msgs ...[]byte) {
 		for _, m := range msgs {
 			// A stream-ending case may be cut off mid-write by the gateway closing the connection, which is the point.
@@ -145,36 +145,44 @@ func toTCP(ctx context.Context, cases []hostile.Case, o options, stderr io.Write
 			}
 		}
 	}
+	stopped := func() int {
+		fmt.Fprintln(stderr, "hostile-sender: stopped before every case was sent")
+		return 1
+	}
 
-	// 2: One case at a time.
 	for i, c := range cases {
-		if i > 0 {
-			select {
-			case <-time.After(o.delay):
-			case <-ctx.Done():
-				return 0
-			}
+		if i > 0 && !cli.Sleep(ctx, o.delay) {
+			return stopped()
 		}
-		if c.Impersonates && o.intruderCert == "" {
+		if c.Impersonates && intruder == nil {
 			fmt.Fprintf(stderr, "skipped %s: it needs -intruder-cert and -intruder-key, a second identity\n", c.Name)
 			continue
 		}
-		conn, err := dial(o.cert, o.key)
+		conn, err := transport.Dial(ctx, o.tcp, client, dialTimeout)
 		if err != nil {
+			if ctx.Err() != nil {
+				return stopped()
+			}
 			fmt.Fprintf(stderr, "hostile-sender: connect: %v\n", err)
 			return 1
 		}
 		if c.Impersonates {
 			send(conn, c.Setup...)
-			time.Sleep(o.delay) // let the gateway publish the victim's track first
-			intruder, err := dial(o.intruderCert, o.intruderKey)
+			if !cli.Sleep(ctx, o.delay) { // let the gateway publish the victim's track first
+				_ = conn.Close()
+				return stopped()
+			}
+			attacker, err := transport.Dial(ctx, o.tcp, intruder, dialTimeout)
 			if err != nil {
 				_ = conn.Close()
+				if ctx.Err() != nil {
+					return stopped()
+				}
 				fmt.Fprintf(stderr, "hostile-sender: connect as the intruder: %v\n", err)
 				return 1
 			}
-			send(intruder, c.Attack)
-			_ = intruder.Close()
+			send(attacker, c.Attack)
+			_ = attacker.Close()
 		} else {
 			send(conn, slices.Concat(c.Setup, [][]byte{c.Attack})...)
 		}

@@ -114,6 +114,15 @@ func Cases(now time.Time) []Case {
 			Impersonates: true, Stage: pipeline.ErrDropped, Cause: state.ErrOriginConflict,
 		},
 		{
+			Name: "future-stamp", Description: "A report is stamped an hour ahead, so no honest report can replace it until then.",
+			Expect: "dropped by state: stamped further ahead than clock drift explains, logged as a warning",
+			Attack: func() []byte {
+				ev := event(uid("future-stamp"), now.Add(time.Hour))
+				return marshal(ev)
+			}(),
+			Stage: pipeline.ErrDropped, Cause: state.ErrFutureTime,
+		},
+		{
 			Name: "far-future-stale", Description: "A report claims to stay valid until 2099.",
 			Expect: "published, with its expiry clamped to just under 30 days",
 			Attack: func() []byte {
@@ -122,8 +131,9 @@ func Cases(now time.Time) []Case {
 				return marshal(ev)
 			}(),
 			Check: func(e entity.Entity) error {
-				// The gateway clamps against its own clock, which runs a little behind the report's stamp, so check
-				// the server's bound: under 30 days out.
+				// The gateway clamps to a minute under 30 days from its own clock, which reads a little later than the
+				// report's stamp, so check the server's bound instead: under 30 days from the stamp. That holds while
+				// the two clocks are less than a minute apart.
 				if limit := now.Add(30 * 24 * time.Hour); e.ExpiryTime == nil || !e.ExpiryTime.Before(limit) {
 					return fmt.Errorf("expiry %v is not before %v", e.ExpiryTime, limit)
 				}
@@ -207,7 +217,7 @@ func Cases(now time.Time) []Case {
 			Name: "garbage", Description: "Text that isn't XML at all, between two messages.",
 			Expect: "refused by the parser, and the next message still gets through",
 			Attack: []byte("GET / HTTP/1.1\r\n\r\n"),
-			Stage:  pipeline.ErrParse, Cause: cot.ErrTrailingData,
+			Stage:  pipeline.ErrParse, Cause: cot.ErrStrayData,
 		},
 		{
 			Name: "entity-reference", Description: "A report uses an entity the document never defines, the billion-laughs payload.",
