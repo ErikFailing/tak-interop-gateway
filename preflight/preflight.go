@@ -113,7 +113,8 @@ func (c *Checker) Check(e entity.Entity) []Violation {
 // CheckJSON checks one entity given as a JSON object in the REST API's shape, the form `takgw preflight` reads. It
 // applies every rule, including known-fields and field-name-case. It returns an error wrapping ErrInvalidJSON, and no
 // violations, when the document can't be read unambiguously: malformed JSON, anything but a single object, a duplicate
-// key, or a value of the wrong type for any field the SDK declares.
+// key, a value of the wrong type for any field the SDK declares, or a date-time that isn't an RFC 3339 string, the only
+// form the API's protobuf Timestamps take, though the Go SDK reads others.
 func (c *Checker) CheckJSON(data []byte) ([]Violation, error) {
 	// 1: Walk the raw document against the SDK's types. This rejects what can't be read unambiguously and notes keys the
 	// SDK doesn't declare, which encoding/json would otherwise drop without a word.

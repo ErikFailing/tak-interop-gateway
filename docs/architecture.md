@@ -88,6 +88,12 @@ from the code, and a test fails if the committed copy is stale.
   case: encoding/json would fold them together and keep the last, while another reader might keep the first. A key
   that differs from a field's name only in case, such as `EntityId`, breaks the `field-name-case` rule: encoding/json
   and the SDK read it as the field, but a case-sensitive reader drops it, so it is an error, not an unknown field.
+- **Times as the server reads them.** Every date-time field is a `google.protobuf.Timestamp` in the API's protobuf
+  schema (`created_time`, `expiry_time`, `source_update_time` and the rest, as Anduril's C++ SDK generates them), and
+  protobuf's JSON form for a Timestamp is an RFC 3339 string with a time zone, at most nine fractional digits, in
+  years 1 to 9999. The Go SDK decodes more leniently: a number as Unix seconds, a time with no zone as UTC, a space
+  for the `T`, a bare date. `CheckJSON` reads each time the way protobuf does and refuses the document otherwise, so
+  the checker never passes a time the SDK reads one way and the server another.
 - **Where the docs disagree, follow the server.** The guide's field table lists only `integrationName` as required in
   `provenance`, but its example server error is `provenance.dataType must be set`, so both are errors.
 
@@ -145,7 +151,10 @@ from the code, and a test fails if the committed copy is stale.
   reversed, the repeat check removed, the entity limit not enforced, the expiry ignored when holding back an
   unchanged report, and the change digest including the expiry time), were each caught. The clamp was missed until a
   seed reached that branch, so the seeds now include a stale time decades out, as static markers send, and a report
-  about to expire. CI runs it for 30 seconds on every push.
+  about to expire. CI runs it for 30 seconds on every push, with a 5-second budget for shrinking each new input:
+  with Go's default of up to a minute, every worker ends up shrinking and fuzzing stops, because each exec runs the
+  stream twice and most of its time goes to `CheckJSON`'s decode into the SDK's type. The oracle checks each
+  published JSON once per exec, since the determinism run must publish the same JSON.
 - `takgw serve` is tested end to end: a `cot-gen` scenario on stdin whose output then passes `takgw preflight
   -strict`, a live TCP connection stopped by cancelling its context, the connection limit, the idle timeout, every
   usage error, a malformed stream and a failing output. Its input side is tested for a stalled TLS handshake not

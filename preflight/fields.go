@@ -9,8 +9,10 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	lattice "github.com/anduril/lattice-sdk-go/v5"
@@ -82,6 +84,9 @@ func (w *walker) value(path string, t reflect.Type, depth int) error {
 	tok, err := w.dec.Token()
 	if err != nil {
 		return invalid(err)
+	}
+	if deref(t) == timeType {
+		return checkTimestamp(path, tok)
 	}
 	switch tok {
 	case json.Delim('{'):
@@ -171,6 +176,41 @@ func (w *walker) array(path string, t reflect.Type, depth int) error {
 		return invalid(err)
 	}
 	return nil
+}
+
+// timeType is the SDK's type for every date-time field. In the API's protobuf schema each of them is a
+// google.protobuf.Timestamp.
+var timeType = reflect.TypeFor[time.Time]()
+
+// maxFraction is the longest fractional-seconds part a Timestamp may have: nanoseconds.
+const maxFraction = len(".999999999")
+
+// checkTimestamp checks a date-time value the way protobuf's JSON decoder reads a Timestamp: a string in RFC 3339,
+// with a time zone, at most nine fractional digits, and a year from 1 to 9999, or null to leave the field unset. The
+// Go SDK is more lenient when it decodes: it also takes a number as Unix seconds, a date and time with no time zone
+// as UTC, a space in place of the T, and a date alone. A server that reads the protobuf schema refuses every one of
+// those, so the SDK and the server would disagree about the document.
+func checkTimestamp(path string, tok json.Token) error {
+	if tok == nil {
+		return nil
+	}
+	s, isString := tok.(string)
+	ok := isString
+	if ok {
+		t, err := time.Parse(time.RFC3339Nano, s)
+		dot, zone := strings.LastIndexByte(s, '.'), strings.LastIndexAny(s, "Zz+-")
+		ok = err == nil && t.UTC().Year() >= 1 && t.UTC().Year() <= 9999 && (dot < 0 || zone < dot || zone-dot <= maxFraction)
+	}
+	if ok {
+		return nil
+	}
+	shown := fmt.Sprint(tok)
+	if isString {
+		shown = strconv.Quote(s)
+	}
+	return fmt.Errorf("%w: %s is %s, not an RFC 3339 date-time string: the API's times are protobuf Timestamps, "+
+		"which take no other form in JSON, though the Go SDK also reads Unix seconds and times with no time zone",
+		ErrInvalidJSON, path, shown)
 }
 
 // caseMatch returns the declared field key matches when case is ignored, as encoding/json matches. The names are

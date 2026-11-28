@@ -185,6 +185,9 @@ the rules in [docs/rules.md](docs/rules.md). Each rule cites the section of Andu
 line of the Go SDK, that it encodes, pinned to the commit it was read from. Enum values are checked by asking the
 installed SDK's own parsers, and field names by walking the SDK's own types, so a value like `"FRIENDLY"` (instead of
 `"DISPOSITION_FRIENDLY"`) or a key like `source_update_time` is caught before the server silently drops or rejects it.
+A line the checker can't read unambiguously is refused outright: a duplicate key, a value of the wrong type, or a time
+that isn't an RFC 3339 string. The API's times are protobuf Timestamps, which take no other form in JSON, although the
+Go SDK, when it decodes, also reads Unix seconds, times with no time zone and bare dates.
 
 ```console
 $ takgw preflight -now 2026-11-27T18:00:00Z entities.jsonl
@@ -233,9 +236,15 @@ go test -race ./...
 go test -run='^$' -fuzz=FuzzParse ./internal/cot           # runs until Ctrl-C; add -fuzztime=60s to bound it
 go test -run='^$' -fuzz=FuzzFramer ./internal/transport
 go test -run='^$' -fuzz=FuzzMap ./internal/mapping
-go test -run='^$' -fuzz=FuzzCheckJSON ./preflight
-go test -run='^$' -fuzz=FuzzPipeline ./internal/pipeline
+go test -run='^$' -fuzz=FuzzCheckJSON -fuzzminimizetime=5s ./preflight
+go test -run='^$' -fuzz=FuzzPipeline -fuzzminimizetime=5s ./internal/pipeline
 ```
+
+Give `FuzzCheckJSON` and `FuzzPipeline` the `-fuzzminimizetime=5s`. Go's fuzzer shrinks each input that finds new
+coverage before keeping it, for up to a minute by default, and a worker shrinking an input isn't fuzzing. These two
+targets' execs are slow, so with the default every worker ends up shrinking at once and fuzzing stops: a 60-second
+`FuzzPipeline` run from its seeds went 54 seconds without a worker finishing a job, and kept 2 new inputs. With 5
+seconds, the same run kept 140; `FuzzCheckJSON` kept 79 instead of 15.
 
 - `FuzzParse` checks that the CoT parser never panics and that anything it accepts survives a marshal and re-parse
   unchanged.

@@ -345,6 +345,8 @@ func TestCheckJSON(t *testing.T) {
 		wantDetail string // a substring of the first violation's detail, when set
 	}{
 		{"SDK field the model doesn't use", with("", `"description":"a test entity","createdTime":"2026-11-27T17:00:00Z"`), nil, ""},
+		{"time with an offset and nanoseconds", with("", `"createdTime":"2026-11-27T10:00:00.123456789-07:00"`), nil, ""},
+		{"time left null", with("", `"createdTime":null`), nil, ""},
 		{"misspelled top-level key", with("", `"isLiv":true`), []hit{{"known-fields", "isLiv"}}, "not a field of Entity"},
 		// A key that differs from a field's name only in case is read as that field by encoding/json and the SDK, but
 		// dropped by a case-sensitive reader, so it is its own error rather than an unknown field.
@@ -397,6 +399,16 @@ func TestCheckJSONRefuses(t *testing.T) {
 		// description is a string in the SDK, and not a field of the model, so only the decode into the SDK's type sees
 		// it. (Not createdTime: the SDK reads a number in a date-time field as Unix seconds.)
 		{"wrong type on a field only the SDK has", `{"description":5}`, false},
+		// Date-times the Go SDK reads but a protobuf Timestamp doesn't: the SDK and the server would disagree.
+		{"time as Unix seconds", `{"createdTime":1764259200}`, false},
+		{"time with no time zone", `{"createdTime":"2026-11-27T16:00:00"}`, false},
+		{"time with a space for the T", `{"createdTime":"2026-11-27 16:00:00Z"}`, false},
+		{"date with no time", `{"createdTime":"2026-11-27"}`, false},
+		{"time with ten fractional digits", `{"createdTime":"2026-11-27T16:00:00.1234567890Z"}`, false},
+		{"year zero", `{"createdTime":"0000-11-27T16:00:00Z"}`, false},
+		{"time as an object", `{"createdTime":{"seconds":5}}`, false},
+		{"nested time as Unix seconds", `{"health":{"updateTime":1764259200}}`, false},
+		{"time in a model field with no time zone", `{"expiryTime":"2026-11-27T18:02:00"}`, false},
 		{"syntax error", `{"entityId":}`, false},
 		{"too deep", `{"description":` + strings.Repeat("[", 70) + strings.Repeat("]", 70) + `}`, false},
 		{"duplicate key", `{"entityId":"a","entityId":"b"}`, true},

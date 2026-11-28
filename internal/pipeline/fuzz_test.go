@@ -64,7 +64,14 @@ var (
 //   - The publisher received exactly the entities reported as published, in order.
 //   - Running the same stream through a fresh pipeline gives exactly the same outcomes.
 //
-// Run it with: go test -fuzz=FuzzPipeline ./internal/pipeline
+// Run it with: go test -fuzz=FuzzPipeline -fuzzminimizetime=5s ./internal/pipeline
+//
+// The 5-second minimization budget matters here. Go's fuzzer shrinks each input that finds new coverage before keeping
+// it, for up to a minute by default, and a worker shrinking an input isn't fuzzing. An exec of this target runs a whole
+// stream twice, so shrinking a stream of a few kilobytes takes seconds, and idle workers take shrinking jobs as readily
+// as 100-millisecond fuzzing ones: with the default, every worker ends up shrinking and fuzzing stops. In a 60-second
+// run from the seeds alone, the default left no job finishing for 54 seconds and kept 2 new inputs; with 5 seconds,
+// the same run kept 140.
 func FuzzPipeline(f *testing.F) {
 	// 1: Seeds: a scenario stream, a repeated report, an out-of-order pair, every affiliation (more uids than the
 	// entity limit), noise between messages, the mapper's less common branches, an unchanged report whose published
@@ -113,8 +120,9 @@ func FuzzPipeline(f *testing.F) {
 
 	// 2: The oracle.
 	f.Fuzz(func(t *testing.T, stream []byte) {
-		first := runStream(t, stream)
-		if second := runStream(t, stream); !slices.Equal(first, second) {
+		checked := map[string]bool{}
+		first := runStream(t, stream, checked)
+		if second := runStream(t, stream, checked); !slices.Equal(first, second) {
 			t.Fatalf("not deterministic\nfirst:  %q\nsecond: %q", first, second)
 		}
 	})
@@ -247,8 +255,10 @@ func content(e entity.Entity) string {
 }
 
 // runStream frames a stream and processes every message with one fresh pipeline, checking each outcome. It returns a
-// line per outcome, for the determinism check.
-func runStream(t *testing.T, stream []byte) []string {
+// line per outcome, for the determinism check. checked holds the published JSON already passed by CheckJSON in this
+// exec, so the determinism run, which must publish the same JSON, doesn't pay to check it again: CheckJSON is most of
+// an exec's time.
+func runStream(t *testing.T, stream []byte, checked map[string]bool) []string {
 	clock := func() time.Time { return fuzzNow }
 	mem := &publish.Memory{}
 	p, err := pipeline.New(pipeline.Config{Mapping: feed, State: fuzzState, Publisher: mem, Clock: clock})
@@ -272,7 +282,7 @@ func runStream(t *testing.T, stream []byte) []string {
 			break
 		}
 		res, err := p.Process(context.Background(), msg, "feed")
-		line := outcome(t, ref, clock, res, err)
+		line := outcome(t, ref, clock, res, err, checked)
 		if err == nil {
 			sent = append(sent, res.Entity)
 		}
@@ -293,7 +303,7 @@ func runStream(t *testing.T, stream []byte) []string {
 }
 
 // outcome checks one Process result against the oracle and describes it in one line.
-func outcome(t *testing.T, ref *model, clock func() time.Time, res pipeline.Result, err error) string {
+func outcome(t *testing.T, ref *model, clock func() time.Time, res pipeline.Result, err error, checked map[string]bool) string {
 	t.Helper()
 
 	// 1: A refusal names exactly one stage. Parse and map refusals happen before the state stage, so the model
@@ -341,8 +351,11 @@ func outcome(t *testing.T, ref *model, clock func() time.Time, res pipeline.Resu
 		t.Fatalf("published an entity with findings: %v", res.Violations)
 	}
 	data := mustJSON(t, res.Entity)
-	if vs, err := preflight.NewChecker(clock).CheckJSON([]byte(data)); err != nil || vs != nil {
-		t.Fatalf("published entity's JSON fails preflight: %v %v\n%s", err, vs, data)
+	if !checked[data] {
+		if vs, err := preflight.NewChecker(clock).CheckJSON([]byte(data)); err != nil || vs != nil {
+			t.Fatalf("published entity's JSON fails preflight: %v %v\n%s", err, vs, data)
+		}
+		checked[data] = true
 	}
 	ref.last[*res.Entity.EntityID] = published{
 		updated: *res.Entity.Provenance.SourceUpdateTime, expiry: *res.Entity.ExpiryTime, content: content(res.Entity),
